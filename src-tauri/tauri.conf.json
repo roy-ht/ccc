@@ -1,0 +1,42 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ccc",
+  "version": "0.10.1",
+  "identifier": "com.htanaka.ccc",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Claude Code Conductor",
+        "width": 1200,
+        "height": 800,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "externalBin": ["binaries/ccc-claude-auth", "binaries/ccc-sessions", "binaries/ccc-ssh"],
+    "resources": [
+      "binaries/ccc-claude-code-hook/darwin-arm64/ccc-claude-code-hook",
+      "binaries/ccc-claude-code-hook/linux-arm64/ccc-claude-code-hook",
+      "binaries/ccc-claude-code-hook/linux-amd64/ccc-claude-code-hook"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

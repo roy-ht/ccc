@@ -1,0 +1,24 @@
+[package]
+name = "ccc-archive"
+version = "0.4.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "Claude Code セッション/メモリのローカル集約ストア (SQLite + 自前 lindera FTS5)"
+
+[dependencies]
+# bundled SQLite（FTS5 有効・load_extension 不要）。同じ libsqlite3-sys にリンクし
+# in-process で FTS5 トークナイザを登録するため ABI が完全一致する。
+rusqlite = { version = "0.32", features = ["bundled"] }
+# 形態素解析（日本語 FTS）。IPADIC をバイナリ埋め込み（サイズ重視）。
+# 注: reqwest/rustls/ring 等は lindera-ipadic の [build-dependencies]（辞書DL）由来で、
+#     resolver=2 により最終バイナリには載らない（ビルド時のみ。初回は辞書DLでネット要）。
+lindera = { version = "2.3.4", features = ["embed-ipadic"] }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# メモリスナップショットの内容ハッシュ（重複排除キー）。
+sha2 = { workspace = true }
+# `messages.raw` / `events.payload` の透過圧縮（schema v2）。
+# レベル 3 で 1KB 級の JSON を 1ms 以下に圧縮できる。
+zstd = "0.13"

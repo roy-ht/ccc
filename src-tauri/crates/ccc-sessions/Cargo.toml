@@ -1,0 +1,17 @@
+[package]
+name = "ccc-sessions"
+version = "0.4.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "ccc のセッションアーカイブを検索・閲覧・取込する CLI"
+
+[[bin]]
+name = "ccc-sessions"
+path = "src/main.rs"
+
+[dependencies]
+ccc-archive = { path = "../ccc-archive" }
+clap = { version = "4", features = ["derive"] }
+anyhow = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,16 @@
+[package]
+name = "ccc-ssh"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "ssh ラッパー CLI: port forward 台帳管理と gpg agent forward 自動修復を仕込んだ ssh"
+
+[[bin]]
+name = "ccc-ssh"
+path = "src/main.rs"
+
+[dependencies]
+ccc-sshkit = { path = "../ccc-sshkit" }
+anyhow = { workspace = true }
+libc = "0.2"

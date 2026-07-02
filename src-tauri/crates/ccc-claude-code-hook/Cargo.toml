@@ -1,0 +1,17 @@
+[package]
+name = "ccc-claude-code-hook"
+version = "0.3.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Claude Code hook bridge that forwards hook events to the ccc HTTP receiver"
+
+[[bin]]
+name = "ccc-claude-code-hook"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+ureq = { version = "2", default-features = false, features = ["json"] }

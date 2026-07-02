@@ -1,0 +1,15 @@
+[package]
+name = "ccc-claude-auth"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Sidecar binary that fetches Claude Code credentials from the macOS Keychain for ccc"
+
+[[bin]]
+name = "ccc-claude-auth"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+sha2 = { workspace = true }
+clap = { version = "4", features = ["derive"] }

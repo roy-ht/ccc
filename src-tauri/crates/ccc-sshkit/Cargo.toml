@@ -1,0 +1,12 @@
+[package]
+name = "ccc-sshkit"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "ssh ControlMaster / port forward 台帳 / gpg agent forward 修復の共有ロジック（ccc 本体と ccc-ssh CLI で共用）"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
