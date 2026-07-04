@@ -12,9 +12,15 @@
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::exec::run_with_timeout;
 use crate::ssh_config;
+
+/// mux コマンド（-O check/forward/cancel/exit）の上限。ローカルの control socket
+/// 越し操作なので健全なら数 ms〜（-O forward -R のみサーバ応答待ち）数百 ms。
+/// master プロセスが固まっている（wedged）場合にここで打ち切る。
+pub const MUX_OP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 台帳ファイルの読み書きを直列化するプロセス内ロック。
 /// 操作頻度が低い（UI 操作・60 秒サイクル）ため全ホスト共通の 1 本で足りる。
@@ -135,24 +141,46 @@ pub fn mux_base_args(host_alias: &str) -> Result<Vec<String>, String> {
     }
 }
 
-/// `ssh -O check` から現 master の pid を取得する。master 不在/不通は None。
+/// `ssh -O check` から現 master の pid を取得する。master 不在/不通/無応答は None。
 /// 出力例: "Master running (pid=25742)"（stderr に出る）。
 pub fn master_pid(host_alias: &str) -> Option<u32> {
-    let base = mux_base_args(host_alias).ok()?;
-    let output = Command::new("ssh")
-        .args(&base)
-        .args(["-O", "check", host_alias])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+    match master_pid_detailed(host_alias)? {
+        MasterCheck::Running { pid } => pid,
+        MasterCheck::NotRunning | MasterCheck::Wedged => None,
     }
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    parse_pid(&text)
+}
+
+/// `-O check` の詳細分類。liveness 層が wedged（socket 無応答）を区別するのに使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MasterCheck {
+    /// master 応答あり（pid はパース失敗時 None）
+    Running { pid: Option<u32> },
+    /// master 不在（socket なし・接続拒否）
+    NotRunning,
+    /// control socket が応答しない（master プロセスが固まっている）
+    Wedged,
+}
+
+/// `-O check` を実行して master の状態を分類する。ssh の起動自体に失敗したら None。
+pub fn master_pid_detailed(host_alias: &str) -> Option<MasterCheck> {
+    let base = mux_base_args(host_alias).ok()?;
+    let output = run_with_timeout(
+        Command::new("ssh")
+            .args(&base)
+            .args(["-O", "check", host_alias]),
+        MUX_OP_TIMEOUT,
+    )
+    .ok()?;
+    if output.timed_out {
+        return Some(MasterCheck::Wedged);
+    }
+    if output.code != Some(0) {
+        return Some(MasterCheck::NotRunning);
+    }
+    let text = format!("{}{}", output.stdout, output.stderr);
+    Some(MasterCheck::Running {
+        pid: parse_pid(&text),
+    })
 }
 
 fn parse_pid(text: &str) -> Option<u32> {
@@ -168,17 +196,27 @@ fn parse_pid(text: &str) -> Option<u32> {
 /// （フロントでエラー表示する。例: ポートが他プロセスに使用されている）。
 fn run_mux_forward(host_alias: &str, op: &str, spec: &ForwardSpec) -> Result<(), String> {
     let base = mux_base_args(host_alias)?;
-    let output = Command::new("ssh")
-        .args(&base)
-        .args(["-O", op, "-L", &spec.to_l_arg(), host_alias])
-        .output()
-        .map_err(|e| format!("ssh の起動に失敗: {e}"))?;
-    if output.status.success() {
+    let output = run_with_timeout(
+        Command::new("ssh")
+            .args(&base)
+            .args(["-O", op, "-L", &spec.to_l_arg(), host_alias]),
+        MUX_OP_TIMEOUT,
+    )
+    .map_err(|e| format!("ssh の起動に失敗: {e}"))?;
+    if output.success() {
         Ok(())
+    } else if output.timed_out {
+        Err(format!(
+            "ssh -O {op} が {} 秒以内に応答しませんでした（master が half-open の可能性）",
+            MUX_OP_TIMEOUT.as_secs()
+        ))
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr = output.stderr.trim().to_string();
         let msg = if stderr.is_empty() {
-            format!("ssh -O {op} が非ゼロ終了: {}", output.status)
+            format!(
+                "ssh -O {op} が非ゼロ終了: {}",
+                output.code.map_or("signal".to_string(), |c| c.to_string())
+            )
         } else if stderr.contains("Port forwarding failed") {
             // master 側の bind 失敗。実エラー (Address already in use 等) は
             // master プロセスの stderr に出るためここには届かない。
@@ -449,7 +487,21 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         assert!(!local_port_is_free(port));
         drop(listener);
-        assert!(local_port_is_free(port));
+        // macOS では socket() と FD_CLOEXEC 設定が atomic でないため、並列実行中の
+        // 他テスト（exec の子プロセス spawn）の fork に listener fd が一時継承され、
+        // drop 直後はまだポートが塞がっていることがある。子の exec/終了で解放される
+        // ので短時間リトライする（プロダクション側は元々誤検知許容の best-effort）。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if local_port_is_free(port) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drop 後にポートが解放されない"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     #[test]

@@ -26,9 +26,24 @@
 //! pid 不変ならリモート実行ゼロでスキップする（世代ゲート）。
 
 use std::process::Command;
+use std::time::Duration;
 
-use crate::forwards::{master_pid, mux_base_args, sanitize_alias};
+use crate::exec::run_with_timeout;
+use crate::forwards::{master_pid, mux_base_args, sanitize_alias, MUX_OP_TIMEOUT};
 use crate::ssh_config;
+
+/// mux 経由リモート実行の上限。健全なら 1 秒未満で返るが、gpg-connect-agent の
+/// 初回応答に余裕を持たせる。half-open master ではここで必ず打ち切られる。
+/// `CCC_SSH_EXEC_TIMEOUT`（秒）で上書き可能。
+const DEFAULT_REMOTE_EXEC_TIMEOUT_SECS: u64 = 15;
+
+fn remote_exec_timeout() -> Duration {
+    let secs = std::env::var("CCC_SSH_EXEC_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_REMOTE_EXEC_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
 
 /// ログ出力コールバック。GUI はインスタンスの .debug.txt、CLI は stderr へ流す。
 pub type Log<'a> = &'a dyn Fn(&str);
@@ -66,26 +81,25 @@ fn parse_socket_remote_forwards(ssh_g_output: &str) -> Vec<SocketForward> {
 }
 
 /// リモートでコマンドを実行し exit code を返す（master 経由なので接続コストは小さい）。
+/// タイムアウト（half-open master でのハング）は None = 実行不能扱い。
 fn remote_exec(host_alias: &str, mux_base: &[String], cmd: &str) -> Option<i32> {
-    Command::new("ssh")
-        .args(mux_base)
-        .args(["-o", "BatchMode=yes", host_alias, cmd])
-        .status()
-        .ok()
-        .and_then(|s| s.code())
+    remote_exec_output(host_alias, mux_base, cmd).map(|(code, _)| code)
 }
 
 /// リモートでコマンドを実行し (exit code, stdout) を返す。
+/// タイムアウトは None = 実行不能扱い（half-open の判定自体は liveness 層の責務）。
 fn remote_exec_output(host_alias: &str, mux_base: &[String], cmd: &str) -> Option<(i32, String)> {
-    let out = Command::new("ssh")
-        .args(mux_base)
-        .args(["-o", "BatchMode=yes", host_alias, cmd])
-        .output()
-        .ok()?;
-    Some((
-        out.status.code()?,
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-    ))
+    let out = run_with_timeout(
+        Command::new("ssh")
+            .args(mux_base)
+            .args(["-o", "BatchMode=yes", host_alias, cmd]),
+        remote_exec_timeout(),
+    )
+    .ok()?;
+    if out.timed_out {
+        return None;
+    }
+    Some((out.code?, out.stdout))
 }
 
 /// gpg agent forward の疎通確認。
@@ -171,6 +185,14 @@ fn read_gate(host_alias: &str) -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+/// 最後に疎通 OK を確認した master の pid（TTL 無視で読む）。
+/// liveness 層が wedged master（-O check 無応答 = pid 取得不能）を kill する際の
+/// 対象特定に使う。
+pub fn last_healthy_pid(host_alias: &str) -> Option<u32> {
+    let path = gate_path(host_alias)?;
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
 fn write_gate(host_alias: &str, pid: u32) {
     let Some(path) = gate_path(host_alias) else {
         return;
@@ -197,26 +219,35 @@ fn repair(host_alias: &str, mux_base: &[String], forwards: &[SocketForward], log
         "[agent-socket] {host_alias}: リモート残骸掃除 rc={rc:?} ({cleanup})"
     ));
 
-    // 2. mux 経由で forward だけ再要求（cancel は失敗してよい: 元々張れていない場合がある）
+    // 2. mux 経由で forward だけ再要求（cancel は失敗してよい: 元々張れていない場合がある）。
+    //    -O forward -R はサーバ応答を待つため、half-open では MUX_OP_TIMEOUT で打ち切る。
     for fwd in forwards {
         let spec = fwd.to_r_arg();
-        let _ = Command::new("ssh")
-            .args(mux_base)
-            .args(["-O", "cancel", "-R", &spec, host_alias])
-            .output();
-        let out = Command::new("ssh")
-            .args(mux_base)
-            .args(["-O", "forward", "-R", &spec, host_alias])
-            .output();
+        let _ = run_with_timeout(
+            Command::new("ssh")
+                .args(mux_base)
+                .args(["-O", "cancel", "-R", &spec, host_alias]),
+            MUX_OP_TIMEOUT,
+        );
+        let out = run_with_timeout(
+            Command::new("ssh")
+                .args(mux_base)
+                .args(["-O", "forward", "-R", &spec, host_alias]),
+            MUX_OP_TIMEOUT,
+        );
         match out {
-            Ok(o) if o.status.success() => {
+            Ok(o) if o.success() => {
                 log(&format!("[agent-socket] {host_alias}: 再要求 OK: {spec}"));
             }
+            Ok(o) if o.timed_out => {
+                log(&format!(
+                    "[agent-socket] {host_alias}: 再要求タイムアウト（master が half-open の可能性）: {spec}"
+                ));
+            }
             Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
                 log(&format!(
                     "[agent-socket] {host_alias}: 再要求失敗: {spec}: {}",
-                    stderr.trim()
+                    o.stderr.trim()
                 ));
             }
             Err(e) => {

@@ -30,22 +30,47 @@ ControlMaster・同じソケット** に相乗りし、追加で行うのは冪�
 | `ccc-ssh fwd list <host>` | forward 一覧（GUI の Forwards タブと同じ合成: 台帳+config） |
 | `ccc-ssh fwd add <host> <listen>:<host>:<port>` | `-L` 形式で forward 追加 + 台帳記録 |
 | `ccc-ssh fwd rm <host> <listen_port>` | ccc 台帳の forward を削除 |
-| `ccc-ssh down <host>` | 安全な master 終了（`-O exit`。ゾンビを作る `-O stop` の代替） |
-| `ccc-ssh heal <host>` | gpg agent forward チェック + 修復と台帳リプレイを即時実行 |
+| `ccc-ssh down <host>` | 安全な master 終了（`-O exit`。無応答なら kill フォールバック） |
+| `ccc-ssh heal <host>` | master 死活診断 + gpg agent forward 修復と台帳リプレイを即時実行 |
 
 ## pre-connect フック
 
 `ccc-ssh <host> ...` で接続する際、`exec ssh` の直前に:
 
-1. **世代ゲート**: 前回疎通確認済みの master pid とキャッシュを照合。
+1. **master 死活プローブ**: 網断で half-open（`-O check` は成功するが実通信は
+   永遠に返らない）になった master を検知したら、自動で畳んで再確立する
+   （ユーザー ControlMaster 設定時は `ssh -N -f` で復旧し、config の
+   RemoteForward = gpg forward も復活する）。全段タイムアウト付きなので
+   フックが固まることはない
+2. **世代ゲート**: 前回疎通確認済みの master pid とキャッシュを照合。
    pid 不変ならリモート実行ゼロで即 exec（common case は数 ms）
-2. **gpg agent forward の健全性チェック**: `--no-autostart` 付き
+3. **gpg agent forward の健全性チェック**: `--no-autostart` 付き
    `getinfo socket_name` の応答分類で健全性を判定。不調時のみ修復
-3. **forward 台帳のリプレイ**: master 世代交代を検知したら、台帳に登録済みの
+4. **forward 台帳のリプレイ**: master 世代交代を検知したら、台帳に登録済みの
    `-L` を全件冪等リプレイ
 
 引数から接続先 alias を推定できない場合（複雑なオプション等）は
 フックをスキップして透過実行します。
+
+## 推奨 ssh 設定（ネットワーク断への耐性）
+
+自分の `~/.ssh/config` で ControlMaster を管理しているホストには、以下を
+設定しておくと網断時に master が自滅してクリーンに再確立できます
+（未設定だと TCP keepalive 頼みで死活検知まで数十分かかる）:
+
+```ssh-config
+Host mybox
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%C
+    ControlPersist 30
+    ServerAliveInterval 15
+    ServerAliveCountMax 3
+    ExitOnForwardFailure yes
+```
+
+gpg agent forward（RemoteForward の unix socket）を使うホストでは、リモートの
+`sshd_config` に `StreamLocalBindUnlink yes` を入れると残骸ソケットによる
+bind 失敗が根本的に消えます（サーバ側にしか効かない設定）。
 
 ## 使用例
 

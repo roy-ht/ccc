@@ -111,6 +111,10 @@ pub struct InstanceManager {
     screen_monitors: Arc<DashMap<InstanceId, Arc<Mutex<ScreenMonitor>>>>,
     /// 画面補正が設定した status の控え（hook 適用でクリア、非永続）。
     screen_set: Arc<DashMap<InstanceId, InstanceStatus>>,
+    /// ホストごとの half-open/wedged 連続検知回数（v0.13、非永続）。
+    /// スリープ復帰直後等の偽陽性で健全な master を畳まないよう、
+    /// 連続 2 サイクル（約 2 分）で初めて復旧処理に入る。
+    resilience_strikes: Arc<DashMap<String, u32>>,
 }
 
 impl InstanceManager {
@@ -137,6 +141,7 @@ impl InstanceManager {
             watchdog_suspects: Arc::new(DashMap::new()),
             screen_monitors: Arc::new(DashMap::new()),
             screen_set: Arc::new(DashMap::new()),
+            resilience_strikes: Arc::new(DashMap::new()),
         }
     }
 
@@ -220,6 +225,129 @@ impl InstanceManager {
         hosts.sort();
         hosts.dedup();
         hosts
+    }
+
+    /// 60 秒ループから呼ぶネットワーク断耐性チェック（v0.13）。
+    ///
+    /// 死活プローブは gpg 世代ゲートの**外**で毎サイクル実行する。half-open
+    /// master は `-O check` に応答し pid も不変なため、ゲートでは検知できない。
+    ///
+    /// - master 不在: 何もしない（意図しない自動接続を発生させない）
+    /// - 健全: gpg forward チェック（ゲートが効くのでコストは -O check 程度）+ 台帳同期
+    /// - half-open/wedged: 連続 2 サイクルで畳んで再確立 → gpg forward 修復
+    pub async fn network_resilience_tick(&self, host_alias: &str) {
+        use ccc_sshkit::liveness::{self, MasterLiveness};
+
+        let stderr_log = |msg: &str| eprintln!("[ccc] {msg}");
+
+        let liveness = {
+            let host = host_alias.to_string();
+            tokio::task::spawn_blocking(move || {
+                liveness::probe_master(&host, liveness::DEFAULT_PROBE_TIMEOUT, &|msg| {
+                    eprintln!("[ccc] {msg}")
+                })
+            })
+            .await
+            .unwrap_or(MasterLiveness::NoMaster)
+        };
+
+        let (strike_target_pid, wedged) = match liveness {
+            MasterLiveness::NoMaster => {
+                self.resilience_strikes.remove(host_alias);
+                return;
+            }
+            MasterLiveness::Alive { .. } => {
+                self.resilience_strikes.remove(host_alias);
+                let host = host_alias.to_string();
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::agent_socket::ensure_agent_forward(&host, None);
+                    crate::forwards::sync_ledger(&host);
+                })
+                .await;
+                return;
+            }
+            MasterLiveness::SessionRefused { .. } => {
+                // サーバは応答している（MaxSessions 超過等）。生きたセッションを
+                // 巻き込まないため畳まず、警告に留める
+                stderr_log(&format!(
+                    "[resilience] {host_alias}: mux session を開けないが応答はある（畳まない）"
+                ));
+                self.resilience_strikes.remove(host_alias);
+                return;
+            }
+            MasterLiveness::HalfOpen { pid } => (pid, false),
+            MasterLiveness::Wedged => (None, true),
+        };
+
+        let strikes = {
+            let mut entry = self
+                .resilience_strikes
+                .entry(host_alias.to_string())
+                .or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        if strikes < 2 {
+            stderr_log(&format!(
+                "[resilience] {host_alias}: master 不調を検知（{}）。次サイクルも継続なら復旧します",
+                if wedged { "wedged" } else { "half-open" }
+            ));
+            return;
+        }
+
+        stderr_log(&format!(
+            "[resilience] {host_alias}: master 不調が {strikes} サイクル継続 → 自動復旧を開始"
+        ));
+
+        let user_cm = {
+            let host = host_alias.to_string();
+            tokio::task::spawn_blocking(move || {
+                crate::ssh_config::user_has_control_master(&host).unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false)
+        };
+
+        let recovered = if user_cm {
+            // ユーザー CM 尊重モード: 畳み + `ssh -N -f` 再確立まで sshkit に任せる
+            let host = host_alias.to_string();
+            tokio::task::spawn_blocking(move || {
+                liveness::recover_half_open(&host, true, &|msg| eprintln!("[ccc] {msg}"))
+            })
+            .await
+            .unwrap_or(false)
+        } else {
+            // ccc 専用 master: 畳んでから既存の確立パス（hook 逆転送付き）で立て直す
+            {
+                let host = host_alias.to_string();
+                let pid = strike_target_pid
+                    .or_else(|| ccc_sshkit::agent_socket::last_healthy_pid(host_alias));
+                let _ = tokio::task::spawn_blocking(move || {
+                    liveness::teardown_master(&host, pid, &|msg| eprintln!("[ccc] {msg}"))
+                })
+                .await;
+            }
+            match self.ensure_remote_master(host_alias, None).await {
+                Ok(_) => true,
+                Err(e) => {
+                    stderr_log(&format!(
+                        "[resilience] {host_alias}: master 再確立失敗（次サイクルで再試行）: {e}"
+                    ));
+                    false
+                }
+            }
+        };
+
+        if recovered {
+            self.resilience_strikes.remove(host_alias);
+            let host = host_alias.to_string();
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::agent_socket::ensure_agent_forward(&host, None);
+                crate::forwards::sync_ledger(&host);
+            })
+            .await;
+            stderr_log(&format!("[resilience] {host_alias}: 自動復旧完了"));
+        }
     }
 
     /// ccc 自身が立てた ControlMaster をすべて閉じる。
@@ -1799,42 +1927,53 @@ pub(crate) async fn ensure_remote_master_impl(
 /// 既存 master 経由でリモートの `ccc-hook.sh --health-check` を 1 回叩く。
 /// 必須 env のうち `CCC_INSTANCE_ID` だけ wrapper が注入しないため、ダミー値
 /// `health` をコマンドライン側で付与する（server 側はログ表示にしか使わない）。
+/// half-open master 上ではリモート実行が返らないため 15 秒で打ち切る
+/// （タイムアウト = 失敗 → 呼び出し側の -O exit → 立て直しパスに乗る）。
 async fn health_check_via_master(host_alias: &str) -> Result<(), String> {
     let host = host_alias.to_string();
-    let status = tokio::task::spawn_blocking(move || {
-        Command::new("ssh")
-            .args([
+    let outcome = tokio::task::spawn_blocking(move || {
+        ccc_sshkit::exec::run_with_timeout(
+            Command::new("ssh").args([
                 "-o",
                 &format!("ControlPath={}", ssh_config::CCC_CONTROL_PATH),
+                "-o",
+                "BatchMode=yes",
                 &host,
                 "CCC_INSTANCE_ID=health \"$HOME/.ccc/bin/ccc-hook.sh\" --health-check",
-            ])
-            .status()
+            ]),
+            std::time::Duration::from_secs(15),
+        )
     })
     .await
     .map_err(|e| format!("health check の spawn_blocking 失敗: {e}"))?
     .map_err(|e| format!("ssh の起動に失敗: {e}"))?;
-    if status.success() {
+    if outcome.success() {
         Ok(())
+    } else if outcome.timed_out {
+        Err("ccc-hook.sh --health-check が 15 秒以内に応答しませんでした（master が half-open の可能性）".into())
     } else {
-        Err(format!("ccc-hook.sh --health-check が非ゼロ終了: {status}"))
+        Err(format!(
+            "ccc-hook.sh --health-check が非ゼロ終了: {:?}",
+            outcome.code
+        ))
     }
 }
 
 /// `ssh -O check` で ccc 専用 ControlPath にぶら下がる master が健在か確認する。
-/// 同期 blocking。exit code 0 = master あり、それ以外 = なし/不通。
+/// 同期 blocking。exit code 0 = master あり、それ以外 = なし/不通/無応答。
 fn ssh_master_check(host_alias: &str) -> bool {
-    Command::new("ssh")
-        .args([
+    ccc_sshkit::exec::run_with_timeout(
+        Command::new("ssh").args([
             "-O",
             "check",
             "-o",
             &format!("ControlPath={}", ssh_config::CCC_CONTROL_PATH),
             host_alias,
-        ])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        ]),
+        crate::forwards::MUX_OP_TIMEOUT,
+    )
+    .map(|o| o.success())
+    .unwrap_or(false)
 }
 
 /// Terminal タブの session-group メンバーを kill する（close_shell 時の後始末）。
@@ -1888,18 +2027,20 @@ fn kill_dead_tmux_session(kind: InstanceKind, host_alias: Option<String>, sessio
 
 /// `ssh -O exit` で ccc 専用 ControlPath にぶら下がる master を閉じる。
 /// 不在時もエラーになるが呼び出し側で無視してよい。
+/// master が wedged で socket 無応答の場合もタイムアウトで制御を返す。
 fn ssh_master_exit(host_alias: &str) -> bool {
-    Command::new("ssh")
-        .args([
+    ccc_sshkit::exec::run_with_timeout(
+        Command::new("ssh").args([
             "-O",
             "exit",
             "-o",
             &format!("ControlPath={}", ssh_config::CCC_CONTROL_PATH),
             host_alias,
-        ])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        ]),
+        crate::forwards::MUX_OP_TIMEOUT,
+    )
+    .map(|o| o.success())
+    .unwrap_or(false)
 }
 
 /// ローカルディレクトリを解決する。~ 展開、デフォルト HOME。

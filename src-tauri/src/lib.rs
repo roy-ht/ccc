@@ -129,22 +129,22 @@ pub fn run() {
             // シャドウスクリーン評価タスク（v0.12 画面状態検出）
             app.state::<InstanceManager>().spawn_screen_evaluator();
 
-            // port forward 台帳の世代チェック（検知トリガー②）。
-            // ターミナル側だけで master が再起動されたケースを拾うため、
-            // 接続中リモートホストの master pid を 60 秒ごとに確認し、
-            // 世代交代していれば台帳をリプレイする。
+            // ネットワーク断耐性チェック（v0.13）+ port forward 台帳の世代チェック。
+            // 接続中リモートホストを 60 秒ごとに巡回し、
+            // - master の死活プローブ（half-open は -O check では検知できないため
+            //   mux 経由リモート実行で判定）→ 連続 2 サイクル不調なら畳んで再確立
+            // - gpg agent forward のチェック＋修復（世代ゲート付き）
+            // - 台帳の世代交代リプレイ
+            // を行う。master 不在ホストへの自動接続は行わない。
             let app_handle_for_fwd = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     interval.tick().await;
-                    let hosts = app_handle_for_fwd
-                        .state::<InstanceManager>()
-                        .active_remote_hosts();
-                    for host in hosts {
-                        let _ =
-                            tokio::task::spawn_blocking(move || forwards::sync_ledger(&host)).await;
+                    let manager = app_handle_for_fwd.state::<InstanceManager>();
+                    for host in manager.active_remote_hosts() {
+                        manager.network_resilience_tick(&host).await;
                     }
                 }
             });

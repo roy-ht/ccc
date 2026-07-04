@@ -9,8 +9,10 @@
 use std::io::{IsTerminal, Write};
 use std::process::Command;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::Duration;
 
-use ccc_sshkit::{agent_socket, forwards};
+use ccc_sshkit::liveness::{self, MasterLiveness};
+use ccc_sshkit::{agent_socket, forwards, ssh_config};
 
 /// 親（ccc-ssh 自身）が受けたシグナルを子（ssh）に転送するために共有する PID。
 /// シグナルハンドラから async-signal-safe に読み書きしたいので AtomicI32。
@@ -41,8 +43,11 @@ fn print_help() {
   ccc-ssh fwd list <host>               forward 一覧（台帳 + ssh config）
   ccc-ssh fwd add <host> <L:H:P|port>   forward 追加（例: 8080:localhost:80、port のみなら同番転送）
   ccc-ssh fwd rm <host> <listen_port>   ccc 台帳の forward を削除
-  ccc-ssh down <host>                   master を安全に終了（-O exit。-O stop は使わないこと）
-  ccc-ssh heal <host>                   gpg agent forward チェック＋修復と台帳リプレイを即時実行
+  ccc-ssh down <host>                   master を安全に終了（-O exit。無応答なら kill まで行う）
+  ccc-ssh heal <host>                   master 死活診断＋gpg forward 修復と台帳リプレイを即時実行
+
+pre-connect フックは網断で half-open になった master も検知し、自動で畳んで
+再確立します（ユーザー ControlMaster 設定時は ssh -N -f で復旧）。
 
 環境変数:
   CCC_SSH_VERBOSE=1                     pre-connect フックのログをすべて表示
@@ -155,14 +160,50 @@ fn restore_terminal_modes() {
 fn pre_connect_hook(host: &str) {
     let verbose = matches!(std::env::var("CCC_SSH_VERBOSE").as_deref(), Ok(v) if !v.is_empty());
     let log = move |msg: &str| {
-        // 普段は修復関連のみ表示し、ノイズを抑える
-        if verbose || msg.contains("不調") || msg.contains("修復") || msg.contains("再要求")
+        // 普段は修復・復旧関連のみ表示し、ノイズを抑える
+        if verbose
+            || msg.contains("不調")
+            || msg.contains("修復")
+            || msg.contains("再要求")
+            || msg.contains("[liveness]")
         {
             eprintln!("ccc-ssh: {msg}");
         }
     };
+    preflight_master(host, &log);
     agent_socket::ensure_agent_forward(host, false, &log);
     forwards::sync_ledger(host);
+}
+
+/// half-open / wedged master の検知と復旧（v0.13）。
+///
+/// GUI の 60 秒ループは偽陽性対策で 2 サイクル連続の不調を待つが、CLI は
+/// 「ユーザーがまさに接続しようとしている」文脈なので単発判定で即復旧する
+/// （代替は half-open master への mux で ssh ごと固まること）。全段タイムアウト
+/// 付きなので、最悪でもプローブ 15 秒 + 復旧数十秒で必ず ssh 起動に到達する。
+fn preflight_master(host: &str, log: &dyn Fn(&str)) {
+    let pid = match liveness::probe_master(host, Duration::from_secs(15), log) {
+        MasterLiveness::HalfOpen { pid } => {
+            log(&format!(
+                "[liveness] {host}: master が half-open（網断の残骸）→ 畳んで復旧します"
+            ));
+            pid
+        }
+        MasterLiveness::Wedged => agent_socket::last_healthy_pid(host),
+        // NoMaster / Alive / SessionRefused は手を出さない
+        _ => return,
+    };
+
+    if ssh_config::user_has_control_master(host).unwrap_or(false) {
+        // ユーザー CM 尊重モード: 畳み + `ssh -N -f` 再確立まで行う
+        // （config の RemoteForward = gpg forward が新 master で復活する）
+        liveness::recover_half_open(host, true, log);
+    } else {
+        // ccc 専用 master（GUI 所有）: hook 逆転送の構成は GUI しか知らないため
+        // 畳むだけ。この後の透過 ssh は素の接続として張られ、GUI 側は次の
+        // 60 秒サイクルで master を再確立する
+        liveness::teardown_master(host, pid, log);
+    }
 }
 
 /// ssh の引数列から接続先（host alias）を推定する。
@@ -308,32 +349,22 @@ fn cmd_down(args: &[String]) -> i32 {
         eprintln!("使い方: ccc-ssh down <host>");
         return 2;
     };
-    let base = match forwards::mux_base_args(host) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("ccc-ssh: {e}");
-            return 1;
-        }
-    };
+    if matches!(
+        forwards::master_pid_detailed(host),
+        None | Some(forwards::MasterCheck::NotRunning)
+    ) {
+        eprintln!("ccc-ssh: master が見つかりません");
+        return 1;
+    }
     // -O exit: master と全接続を畳んでポートも解放する。
     // -O stop はソケットだけ消して master とポートが残る（ゾンビ化）ので提供しない。
-    let status = Command::new("ssh")
-        .args(&base)
-        .args(["-O", "exit", host.as_str()])
-        .status();
-    match status {
-        Ok(s) if s.success() => {
-            println!("master を終了しました（次の接続で forward は自動再適用されます）");
-            0
-        }
-        Ok(_) => {
-            eprintln!("ccc-ssh: master が見つからないか、終了に失敗しました");
-            1
-        }
-        Err(e) => {
-            eprintln!("ccc-ssh: ssh の起動に失敗: {e}");
-            1
-        }
+    // teardown_master は -O exit 無応答（wedged）時に kill フォールバックまで行う。
+    if liveness::teardown_master(host, agent_socket::last_healthy_pid(host), &stderr_log) {
+        println!("master を終了しました（次の接続で forward は自動再適用されます）");
+        0
+    } else {
+        eprintln!("ccc-ssh: master が見つからないか、終了に失敗しました");
+        1
     }
 }
 
@@ -342,7 +373,9 @@ fn cmd_heal(args: &[String]) -> i32 {
         eprintln!("使い方: ccc-ssh heal <host>");
         return 2;
     };
-    // heal はユーザーが明示的に再診断を要求する経路。世代ゲートを必ずバイパスする。
+    // heal はユーザーが明示的に再診断を要求する経路。まず master の死活を診断して
+    // half-open/wedged なら畳んで復旧し、その後世代ゲートをバイパスして再チェックする。
+    preflight_master(host, &stderr_log);
     let healthy = agent_socket::ensure_agent_forward(host, true, &stderr_log);
     forwards::sync_ledger(host);
     if healthy {

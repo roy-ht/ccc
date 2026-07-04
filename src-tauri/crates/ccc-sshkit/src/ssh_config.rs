@@ -165,10 +165,32 @@ pub fn build_master_ssh_args(alias: &str, hook_port: u16) -> anyhow::Result<Vec<
         "ControlPersist=30".into(),
         "-o".into(),
         "ExitOnForwardFailure=yes".into(),
+        // 網断時に master が自滅してクリーンな再確立に収束するよう keepalive を
+        // 明示する（無指定だと TCP keepalive 頼みで死活検知まで数十分〜時間単位）。
+        "-o".into(),
+        "ServerAliveInterval=15".into(),
+        "-o".into(),
+        "ServerAliveCountMax=3".into(),
         "-R".into(),
         format!("127.0.0.1:{hook_port}:127.0.0.1:{hook_port}"),
         alias.into(),
     ])
+}
+
+/// `ssh -G` が解決した ServerAliveInterval（秒）を返す。0 = keepalive 無効。
+/// 対象ホストが 0 の場合、網断時の master 自滅が期待できないため、liveness 層が
+/// 警告ログや再確立時の `-o ServerAliveInterval` 注入の判断に使う。
+pub fn server_alive_interval(alias: &str) -> anyhow::Result<u32> {
+    Ok(parse_server_alive_interval(&run_ssh_g(alias)?))
+}
+
+/// `ssh -G` 出力から `serveralive interval` 行をパースする（見つからなければ 0）。
+pub fn parse_server_alive_interval(ssh_g_output: &str) -> u32 {
+    ssh_g_output
+        .lines()
+        .find_map(|line| line.strip_prefix("serveraliveinterval "))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 /// 各インスタンス用の ssh 引数を組み立てる。
