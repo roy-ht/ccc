@@ -44,7 +44,9 @@ fn print_help() {
   ccc-ssh fwd add <host> <L:H:P|port>   forward 追加（例: 8080:localhost:80、port のみなら同番転送）
   ccc-ssh fwd rm <host> <listen_port>   ccc 台帳の forward を削除
   ccc-ssh down <host>                   master を安全に終了（-O exit。無応答なら kill まで行う）
-  ccc-ssh heal <host>                   master 死活診断＋gpg forward 修復と台帳リプレイを即時実行
+  ccc-ssh heal <host>                   強制的にリモート forward socket を張り直す（gpg forward が
+                                        「check は通るのに実際は切れている」ケース対応。健全な forward
+                                        も一瞬切断されて即再バインドされます）
 
 pre-connect フックは網断で half-open になった master も検知し、自動で畳んで
 再確立します（ユーザー ControlMaster 設定時は ssh -N -f で復旧）。
@@ -190,7 +192,18 @@ fn preflight_master(host: &str, log: &dyn Fn(&str)) {
             pid
         }
         MasterLiveness::Wedged => agent_socket::last_healthy_pid(host),
-        // NoMaster / Alive / SessionRefused は手を出さない
+        MasterLiveness::NoMaster => {
+            // 前世代の master が居た痕跡（last_healthy_pid）があるなら、次に走る
+            // 透過 ssh がユーザー config の ControlMaster=auto で新 master を立てる。
+            // その bind の前にリモート残骸 socket を ccc から明示的に unlink する
+            // （sshd の StreamLocalBindUnlink 頼みの沈黙失敗を回避）。
+            // last_healthy_pid が None（初回接続）は掃除不要なのでスキップ。
+            if agent_socket::last_healthy_pid(host).is_some() {
+                agent_socket::cleanup_stale_remote_sockets(host, log);
+            }
+            return;
+        }
+        // Alive / SessionRefused は手を出さない
         _ => return,
     };
 
@@ -373,9 +386,20 @@ fn cmd_heal(args: &[String]) -> i32 {
         eprintln!("使い方: ccc-ssh heal <host>");
         return 2;
     };
-    // heal はユーザーが明示的に再診断を要求する経路。まず master の死活を診断して
-    // half-open/wedged なら畳んで復旧し、その後世代ゲートをバイパスして再チェックする。
+    // heal はユーザーが明示的に「疑わしいから今すぐ張り直せ」と要求する経路。
+    //
+    // 1. preflight_master: half-open/wedged なら畳んで復旧。NoMaster+痕跡ありなら
+    //    後段の透過 ssh 用に残骸 socket を掃除
+    // 2. cleanup_stale_remote_sockets: **master が Alive でも**リモート socket を
+    //    明示的に unlink する。これにより、check が「Healthy」と誤判定するケース
+    //    （例: getinfo がローカル側パスを返し保守的に Healthy 扱いになる）でも、
+    //    直後の check が Broken を返し repair の -O cancel/-O forward -R が走って
+    //    forward が確実に張り直される。健全な forward も一瞬切断されるが、直後の
+    //    repair で数百 ms〜数秒で復元する（gpg 操作中は再試行を求む）
+    // 3. ensure_agent_forward(force=true): 世代ゲートをバイパスして check → repair
+    // 4. sync_ledger: 台帳の port forward をリプレイ
     preflight_master(host, &stderr_log);
+    agent_socket::cleanup_stale_remote_sockets(host, &stderr_log);
     let healthy = agent_socket::ensure_agent_forward(host, true, &stderr_log);
     forwards::sync_ledger(host);
     if healthy {

@@ -10,7 +10,7 @@ sha2 = "0.10"
 
 [package]
 name = "ccc"
-version = "0.10.1"
+version = "0.10.2"
 description = "Claude Code Conductor"
 authors = ["Hiroyuki Tanaka"]
 edition = "2021"

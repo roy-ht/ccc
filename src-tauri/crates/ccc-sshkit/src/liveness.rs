@@ -199,13 +199,24 @@ fn pid_is_ssh(pid: u32) -> bool {
 ///
 /// ユーザー config の ControlMaster auto により `-N -f` プロセスが新 master になり、
 /// config の RemoteForward（gpg socket）と LocalForward が再要求される。
-/// リモート sshd が StreamLocalBindUnlink yes なら残骸 socket も上書きされる。
+///
+/// **`ssh -N -f` の前に必ず `cleanup_stale_remote_sockets` を呼ぶ**: リモート sshd の
+/// `StreamLocalBindUnlink yes` に頼ると、旧世代 sshd forward 子プロセスが直近の TCP 断を
+/// 検知しきれず socket を握ったまま残っているケースで新 master の bind が沈黙失敗
+/// （あるいは `ExitOnForwardFailure=yes` でここが非ゼロ終了）→ 「接続は張れているが
+/// gpg forward が切れる」障害が再発する。ccc から明示的に unlink すれば sshd 実装差に
+/// も左右されない。
 ///
 /// - BatchMode: 対話認証が必要な構成では即失敗させる（無人ループからの MFA スパム防止）
 /// - ExitOnForwardFailure: forward を張れなければ非ゼロ終了（沈黙故障防止）
 /// - config の ServerAliveInterval が 0 なら keepalive を注入し、以後の網断では
 ///   master が自滅してクリーンな再確立に収束するようにする
 pub fn reestablish_user_cm_master(host_alias: &str, log: Log) -> Result<(), String> {
+    // 新 master が bind する前に、リモート側の残骸 socket を ccc 側から明示的に unlink する。
+    // 失敗しても続行（ログのみ）: 掃除に失敗した場合でも ssh -N -f が bind を試み、
+    // 沈黙故障は後段 `ensure_agent_forward` の check → repair が救う二段構え。
+    crate::agent_socket::cleanup_stale_remote_sockets(host_alias, log);
+
     let mut args: Vec<String> = vec![
         "-N".into(),
         "-f".into(),

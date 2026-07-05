@@ -126,3 +126,17 @@ pub struct OutputPayload {
     pub instance_id: InstanceId,
     pub data: Vec<u8>,
 }
+
+/// gpg agent forward 疎通状態イベント（60 秒監視ループから emit）。
+/// `status` は `ForwardHealth::as_slug()`（`healthy` / `broken` / `unreachable` /
+/// `no_gpg` / `no_forward`）。UI はホスト単位でバッジ表示する。
+#[derive(Debug, Clone, Serialize)]
+pub struct GpgForwardStatusPayload {
+    pub host_alias: String,
+    pub status: String,
+    /// unix epoch 秒（判定タイムスタンプ）
+    pub checked_at: i64,
+    /// 直近判定で不調 → 自動 heal をトリガーしたか（UI 表示用）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_heal_triggered: bool,
+}

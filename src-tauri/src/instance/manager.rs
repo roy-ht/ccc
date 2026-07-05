@@ -115,6 +115,9 @@ pub struct InstanceManager {
     /// スリープ復帰直後等の偽陽性で健全な master を畳まないよう、
     /// 連続 2 サイクル（約 2 分）で初めて復旧処理に入る。
     resilience_strikes: Arc<DashMap<String, u32>>,
+    /// ホストごとの gpg agent forward 疎通状態（60 秒監視ループが更新、非永続）。
+    /// UI がバッジ表示 / Tauri command `get_gpg_forward_status` で取得する。
+    forward_status: Arc<DashMap<String, ccc_sshkit::agent_socket::ForwardHealth>>,
 }
 
 impl InstanceManager {
@@ -142,6 +145,7 @@ impl InstanceManager {
             screen_monitors: Arc::new(DashMap::new()),
             screen_set: Arc::new(DashMap::new()),
             resilience_strikes: Arc::new(DashMap::new()),
+            forward_status: Arc::new(DashMap::new()),
         }
     }
 
@@ -213,6 +217,99 @@ impl InstanceManager {
         result
     }
 
+    /// 特定ホストの gpg agent forward 疎通状態のスナップショット（UI 初期取得用）。
+    /// 60 秒監視ループがまだ判定していないホストは `None`。
+    pub fn forward_status_snapshot(
+        &self,
+        host_alias: &str,
+    ) -> Option<ccc_sshkit::agent_socket::ForwardHealth> {
+        self.forward_status.get(host_alias).map(|v| *v.value())
+    }
+
+    /// 60 秒監視ループの `Alive` 分岐で呼ぶ、gpg agent forward の
+    /// 「軽量プローブ → broken なら無条件自動 heal → 状態遷移で emit」オーケストレーション。
+    ///
+    /// - probe は `ccc_sshkit::agent_socket::probe_agent_forward`（既存 `check` 相当、
+    ///   世代ゲートなし）。コストは mux 経由 1 コマンド実行で ~100–200ms
+    /// - broken 検知時: `ensure_agent_forward(force=true)` を呼び、内部の
+    ///   `repair`（gpgconf --kill + rm -f + -O cancel/-O forward -R）に修復させる。
+    ///   クールダウンは掛けない（ユーザー明示要望）。ストーム防止は後段の check → repair
+    ///   で「healthy に戻ったら repair をスキップする」冪等性に依拠
+    /// - 状態遷移（前回と異なる）で Tauri event `gpg-forward-status-changed` を emit
+    async fn probe_and_maybe_heal(&self, host_alias: &str) {
+        use ccc_sshkit::agent_socket::{self, ForwardHealth};
+
+        let host = host_alias.to_string();
+        let health = tokio::task::spawn_blocking(move || {
+            agent_socket::probe_agent_forward(&host, &|msg| eprintln!("[ccc] {msg}"))
+        })
+        .await
+        .unwrap_or(ForwardHealth::Unreachable);
+
+        // 状態遷移を検出（初回は Some で必ず emit）
+        let previous = self.forward_status.insert(host_alias.to_string(), health);
+        let transitioned = previous != Some(health);
+
+        // broken なら無条件自動 heal（クールダウンなし）
+        let auto_heal_triggered = matches!(health, ForwardHealth::Broken);
+        if auto_heal_triggered {
+            eprintln!(
+                "[ccc] [monitor] {host_alias}: gpg forward broken 検知 → 自動 heal 発火"
+            );
+            let host = host_alias.to_string();
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::agent_socket::ensure_agent_forward(&host, None);
+            })
+            .await;
+            // heal 後の状態を再プローブして反映（成功していれば healthy に戻る）
+            let host = host_alias.to_string();
+            let post = tokio::task::spawn_blocking(move || {
+                agent_socket::probe_agent_forward(&host, &|msg| eprintln!("[ccc] {msg}"))
+            })
+            .await
+            .unwrap_or(ForwardHealth::Unreachable);
+            self.forward_status.insert(host_alias.to_string(), post);
+            eprintln!(
+                "[ccc] [monitor] {host_alias}: 自動 heal 後の状態: {}",
+                post.as_slug()
+            );
+            // 遷移が確定的にあるので必ず emit
+            self.emit_forward_status(host_alias, post, true);
+            return;
+        }
+
+        if transitioned {
+            eprintln!(
+                "[ccc] [monitor] {host_alias}: gpg forward 状態遷移 → {}",
+                health.as_slug()
+            );
+            self.emit_forward_status(host_alias, health, false);
+        }
+    }
+
+    /// gpg forward 状態を Tauri event で通知する。
+    fn emit_forward_status(
+        &self,
+        host_alias: &str,
+        health: ccc_sshkit::agent_socket::ForwardHealth,
+        auto_heal_triggered: bool,
+    ) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let checked_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        super::notify::emit_gpg_forward_status(
+            &self.app_handle.get().cloned(),
+            super::types::GpgForwardStatusPayload {
+                host_alias: host_alias.to_string(),
+                status: health.as_slug().to_string(),
+                checked_at,
+                auto_heal_triggered,
+            },
+        );
+    }
+
     /// 現在 PTY が生きているリモートインスタンスの host_alias 一覧（重複排除済み）。
     /// port forward 台帳の定期世代チェック対象を決めるのに使う。
     pub fn active_remote_hosts(&self) -> Vec<String> {
@@ -258,9 +355,11 @@ impl InstanceManager {
             }
             MasterLiveness::Alive { .. } => {
                 self.resilience_strikes.remove(host_alias);
+                // gpg forward の状態プローブ（ゲートなし）→ broken なら無条件で自動 heal。
+                // 台帳の世代交代リプレイもここで巻き込む（旧来と同じ位置づけ）。
+                self.probe_and_maybe_heal(host_alias).await;
                 let host = host_alias.to_string();
                 let _ = tokio::task::spawn_blocking(move || {
-                    crate::agent_socket::ensure_agent_forward(&host, None);
                     crate::forwards::sync_ledger(&host);
                 })
                 .await;
@@ -1872,6 +1971,20 @@ pub(crate) async fn ensure_remote_master_impl(
 
     // 旧 master が居れば破棄（失敗は無視）
     let _ = ssh_master_exit(host_alias);
+
+    // 新 master が bind する前にリモート残骸 socket を ccc から明示的に unlink する。
+    // sshd の StreamLocalBindUnlink 頼みだと旧 sshd forward 子プロセスが socket を握った
+    // まま残っているケースで bind が沈黙失敗（あるいは ExitOnForwardFailure=yes で
+    // ssh -M -N -f ごと非ゼロ終了）→ 「接続は張れているが gpg forward が切れる」障害
+    // が再発する。掃除は best-effort（失敗しても続行、後段の check → repair が救う）。
+    {
+        let host = host_alias.to_string();
+        let lp = log_path.map(|p| p.to_path_buf());
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::agent_socket::cleanup_stale_remote_sockets(&host, lp.as_deref());
+        })
+        .await;
+    }
 
     // 新規 master を起動
     let args = ssh_config::build_master_ssh_args(host_alias, hook_port)

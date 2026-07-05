@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
   DndContext,
   DragEndEvent,
@@ -18,6 +18,10 @@ import { statusLabel } from "../utils/instanceStatus";
 import { StatusIndicator } from "./StatusIndicator";
 import { useStatusTransitions } from "../hooks/useStatusTransitions";
 import { TypewriterText, useChangeSeq } from "./TypewriterText";
+import {
+  useGpgForwardStatus,
+  GpgForwardStatusEntry,
+} from "../hooks/useGpgForwardStatus";
 
 interface Props {
   instances: InstanceInfo[];
@@ -54,6 +58,18 @@ export function Sidebar({
 
   // 状態変化の未読マーカー
   const { unread } = useStatusTransitions(instances, activeId);
+
+  // gpg agent forward の疎通状態バッジ（60 秒監視ループがバックエンドで更新）
+  const remoteHosts = useMemo(() => {
+    const set = new Set<string>();
+    for (const inst of instances) {
+      if (inst.kind === "remote" && inst.host_alias) {
+        set.add(inst.host_alias);
+      }
+    }
+    return Array.from(set).sort();
+  }, [instances]);
+  const forwardStatuses = useGpgForwardStatus(remoteHosts);
 
   // クリックとドラッグを区別するため 4px の移動でアクティブ化する
   const sensors = useSensors(
@@ -96,6 +112,9 @@ export function Sidebar({
                 instance={s}
                 isActive={s.id === activeId}
                 unreadColor={unread.get(s.id)}
+                forwardStatus={
+                  s.host_alias ? forwardStatuses[s.host_alias] : undefined
+                }
                 onSelect={onSelect}
                 onClose={onClose}
                 onReconnect={onReconnect}
@@ -147,6 +166,8 @@ interface SortableInstanceItemProps {
   isActive: boolean;
   /** 未読変化マーカーの表示色（undefined = 未読なし） */
   unreadColor?: string;
+  /** gpg agent forward の疎通状態（undefined = 監視対象外 / 未判定） */
+  forwardStatus?: GpgForwardStatusEntry;
   onSelect: (id: InstanceId) => void;
   onClose: (id: InstanceId) => void;
   onReconnect: (id: InstanceId) => void;
@@ -158,6 +179,7 @@ function SortableInstanceItem({
   instance,
   isActive,
   unreadColor,
+  forwardStatus,
   onSelect,
   onClose,
   onReconnect,
@@ -221,6 +243,7 @@ function SortableInstanceItem({
           >
             {instance.kind === "remote" ? "R" : "L"}
           </span>
+          {forwardStatus && <GpgForwardBadge entry={forwardStatus} />}
           <span
             className={`instance-name kind-${instance.kind}`}
             title={instance.name}
@@ -268,6 +291,63 @@ function SortableInstanceItem({
       </div>
     </li>
   );
+}
+
+/**
+ * gpg agent forward の疎通状態バッジ。healthy 時は非表示（クリーン UI）、
+ * broken / unreachable / no_gpg のときだけ小さなドットで注意を引く。
+ */
+function GpgForwardBadge({ entry }: { entry: GpgForwardStatusEntry }) {
+  if (entry.status === "healthy") {
+    return null;
+  }
+  const { kind, label, title } = describeForwardStatus(entry);
+  return (
+    <span
+      className={`gpg-forward-badge gpg-forward-badge--${kind}`}
+      title={title}
+      aria-label={label}
+    >
+      {label}
+    </span>
+  );
+}
+
+function describeForwardStatus(entry: GpgForwardStatusEntry): {
+  kind: "broken" | "warn";
+  label: string;
+  title: string;
+} {
+  const checkedAgo = Math.max(
+    0,
+    Math.floor(Date.now() / 1000) - entry.checked_at
+  );
+  const agoStr = checkedAgo < 90 ? `${checkedAgo}秒前` : `${Math.floor(checkedAgo / 60)}分前`;
+  switch (entry.status) {
+    case "broken":
+      return {
+        kind: "broken",
+        label: "gpg⚠",
+        title: entry.auto_heal_triggered
+          ? `gpg forward 断を検知 (${agoStr}) → 自動 heal 実行済み。改善しない場合は ccc-ssh heal <host> を試してください`
+          : `gpg forward 断を検知 (${agoStr})。ccc-ssh heal <host> で修復してください`,
+      };
+    case "unreachable":
+      return {
+        kind: "warn",
+        label: "gpg?",
+        title: `gpg forward 判定不能 (${agoStr}): master が半死に/未起動の可能性`,
+      };
+    case "no_gpg":
+      return {
+        kind: "warn",
+        label: "gpg−",
+        title: `リモートに gpg-connect-agent が見当たらないため状態判定不能 (${agoStr})`,
+      };
+    // TypeScript の exhaustiveness には union で healthy が残るため fallback を返す
+    default:
+      return { kind: "warn", label: "gpg?", title: "unknown state" };
+  }
 }
 
 function StatusMessage({

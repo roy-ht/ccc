@@ -24,6 +24,14 @@
 //! 壊れた状態が生まれるのは master 世代交代の瞬間に限られるため、「最後に疎通
 //! OK を確認した master pid」を**ファイル**（GUI と CLI で共有）にキャッシュし、
 //! pid 不変ならリモート実行ゼロでスキップする（世代ゲート）。
+//!
+//! さらに、v0.10.2 で「新 master 起動の**前**に ccc 側から明示的に残骸 socket を
+//! unlink する」層を追加した（[`cleanup_stale_remote_sockets`]）。理由: sshd の
+//! `StreamLocalBindUnlink yes` に頼っていると、旧世代 sshd の forward 子プロセスが
+//! 直近の TCP 断を検知しきれずに socket を握ったまま残っているケースで新 master の
+//! bind が沈黙失敗（あるいは `ExitOnForwardFailure=yes` で `ssh -N -f` ごと死ぬ）
+//! → 「接続は張れているが gpg forward が切れる」障害が再発する。sshd 実装差にも
+//! 依存するため、ccc から明示的に消す方が確実。
 
 use std::process::Command;
 use std::time::Duration;
@@ -55,6 +63,21 @@ pub struct SocketForward {
     pub remote_path: String,
     /// ローカル側接続先ソケットパス
     pub local_path: String,
+}
+
+/// `rm -f` に渡す 1 引数として安全な形に single-quote する。
+/// 内部の `'` は `'\''` に分割して閉じ・エスケープ・再開。
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// forward 群の remote_path をシェル用に quote して連結する。
+fn quoted_remote_paths(forwards: &[SocketForward]) -> String {
+    forwards
+        .iter()
+        .map(|f| shell_single_quote(&f.remote_path))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 impl SocketForward {
@@ -149,6 +172,75 @@ enum CheckResult {
     Unreachable,
 }
 
+/// GUI 監視ループから参照する forward 疎通状態。`CheckResult` のバリアントに
+/// 「そもそも forward 設定が無い」（=判定対象外）を加えた公開型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForwardHealth {
+    /// unix socket の RemoteForward が config に無い（監視対象外）
+    NoForward,
+    /// リモートに `gpg-connect-agent` が無く判定不能
+    NoGpg,
+    /// 疎通 OK（実 forward or restricted forward の Forbidden 応答が返る）
+    Healthy,
+    /// 不調（listener 死・ソケット残骸・rogue agent 誤起動 の何れか）
+    Broken,
+    /// mux 経由リモート実行に失敗（master が居ない/半死に。判定不能）
+    Unreachable,
+}
+
+impl ForwardHealth {
+    /// UI と CLI で共通のスラッグ表現（Tauri event 用）。
+    pub fn as_slug(self) -> &'static str {
+        match self {
+            ForwardHealth::NoForward => "no_forward",
+            ForwardHealth::NoGpg => "no_gpg",
+            ForwardHealth::Healthy => "healthy",
+            ForwardHealth::Broken => "broken",
+            ForwardHealth::Unreachable => "unreachable",
+        }
+    }
+}
+
+/// **状態確認のみ**を行う軽量プローブ（`ensure_agent_forward` と違って修復しない）。
+///
+/// 世代ゲート・TTL は無視。60 秒監視ループから毎サイクル呼ばれる想定。
+/// コスト: `ssh -G` + mux 経由 1 コマンド実行 = 概ね 100–200ms（既存 `check` と同じ）。
+///
+/// `test -S`（socket file 存在確認のみ）でさらに軽量化する案もあるが、rogue agent
+/// による誤起動（socket file はあるが鍵無し agent が listen）を見逃すため採用しない。
+/// 実装は既存 `check` を再利用する（v0.9 で確定した `classify_agent_reply` の
+/// 分類ロジックが必要）。
+pub fn probe_agent_forward(host_alias: &str, log: Log) -> ForwardHealth {
+    let forwards = match ssh_config::run_ssh_g(host_alias) {
+        Ok(out) => parse_socket_remote_forwards(&out),
+        Err(e) => {
+            log(&format!(
+                "[agent-socket] {host_alias}: probe ssh -G 失敗（unreachable 扱い）: {e}"
+            ));
+            return ForwardHealth::Unreachable;
+        }
+    };
+    if forwards.is_empty() {
+        return ForwardHealth::NoForward;
+    }
+    let mux_base = match mux_base_args(host_alias) {
+        Ok(v) => v,
+        Err(e) => {
+            log(&format!(
+                "[agent-socket] {host_alias}: probe mux_base_args 失敗: {e}"
+            ));
+            return ForwardHealth::Unreachable;
+        }
+    };
+    match check(host_alias, &mux_base, &forwards) {
+        CheckResult::Healthy => ForwardHealth::Healthy,
+        CheckResult::NoGpg => ForwardHealth::NoGpg,
+        CheckResult::Broken => ForwardHealth::Broken,
+        CheckResult::Unreachable => ForwardHealth::Unreachable,
+    }
+}
+
 // ─── 世代ゲート（ファイルベース、GUI/CLI 共有） ──────────────────────────────
 
 fn gate_path(host_alias: &str) -> Option<std::path::PathBuf> {
@@ -203,16 +295,91 @@ fn write_gate(host_alias: &str, pid: u32) {
     let _ = std::fs::write(path, pid.to_string());
 }
 
+// ─── 新 master 起動前の残骸 socket 掃除 ───────────────────────────────────────
+
+/// 掃除 ssh の上限。素の TCP 接続 → 1 コマンド実行 → 切断で健全なら数百 ms〜数秒。
+const CLEANUP_SSH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// リモート側 unix socket forward の残骸を素の ssh で `rm -f` する。
+///
+/// **新 master を bind する直前**（`ssh -N -f` / `ssh -M -N -f` の前）に呼ぶ想定。
+/// リモート sshd の `StreamLocalBindUnlink yes` に頼らず ccc 側から確実に unlink する。
+///
+/// mux は使わない（master が居ない・畳んだ直後の使用を想定）。以下の `-o` で
+/// 「新 master を張らない」「config の RemoteForward を要求しない」ことを保証する:
+/// - `ControlMaster=no` + `ControlPath=none`: 相乗り/新設どちらも抑止
+/// - `ClearAllForwardings=yes`: `-L`/`-R`/`-D` の要求を出さない
+/// - `ExitOnForwardFailure=no`: 掃除 ssh が forward で死なないよう明示的に off
+///
+/// **`gpg-agent` の kill はしない**（`repair` と異なる）。リモート人間ユーザーや
+/// 進行中スクリプトの gpg 使用を巻き込まないため。誤起動 rogue agent が listener を
+/// 握ったままでも、新 socket が path に bind されれば以降の connect() は新 socket に
+/// 向く（旧 listener は orphan になるだけ）。socket が既に存在しなければ `rm -f` は
+/// no-op なので毎回呼んでも安全。
+///
+/// 失敗しても panic しない — ログに残して呼び出し側（新 master 起動）を続行する。
+/// 掃除に失敗しても、その後の `ensure_agent_forward` が世代交代検知 → check → repair
+/// で最終的に救う設計。
+pub fn cleanup_stale_remote_sockets(host_alias: &str, log: Log) {
+    let forwards = match ssh_config::run_ssh_g(host_alias) {
+        Ok(out) => parse_socket_remote_forwards(&out),
+        Err(e) => {
+            log(&format!(
+                "[agent-socket] {host_alias}: 残骸掃除の前段 ssh -G 失敗（続行）: {e}"
+            ));
+            return;
+        }
+    };
+    if forwards.is_empty() {
+        return;
+    }
+
+    let cmd = format!("rm -f {}", quoted_remote_paths(&forwards));
+    let outcome = run_with_timeout(
+        Command::new("ssh").args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ControlPath=none",
+            "-o",
+            "ClearAllForwardings=yes",
+            "-o",
+            "ExitOnForwardFailure=no",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            host_alias,
+            &cmd,
+        ]),
+        CLEANUP_SSH_TIMEOUT,
+    );
+    match outcome {
+        Ok(o) if o.success() => log(&format!(
+            "[agent-socket] {host_alias}: リモート残骸 socket 掃除 OK ({cmd})"
+        )),
+        Ok(o) if o.timed_out => log(&format!(
+            "[agent-socket] {host_alias}: リモート残骸 socket 掃除タイムアウト（続行）"
+        )),
+        Ok(o) => log(&format!(
+            "[agent-socket] {host_alias}: リモート残骸 socket 掃除失敗（続行、code={:?}）: {}",
+            o.code,
+            o.stderr.trim()
+        )),
+        Err(e) => log(&format!(
+            "[agent-socket] {host_alias}: 掃除 ssh の起動に失敗（続行）: {e}"
+        )),
+    }
+}
+
 // ─── 修復 ────────────────────────────────────────────────────────────────────
 
 /// 残骸掃除 + forward 再要求。master は再起動しない。
 fn repair(host_alias: &str, mux_base: &[String], forwards: &[SocketForward], log: Log) {
     // 1. 誤起動した remote gpg-agent を止め、残骸ソケットを削除する
-    let paths = forwards
-        .iter()
-        .map(|f| format!("'{}'", f.remote_path.replace('\'', "'\\''")))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let paths = quoted_remote_paths(forwards);
     let cleanup = format!("gpgconf --kill gpg-agent 2>/dev/null; rm -f {paths}");
     let rc = remote_exec(host_alias, mux_base, &cleanup);
     log(&format!(
@@ -417,5 +584,31 @@ streamlocalbindunlink yes
     fn classify_unparseable_reply_defaults_to_healthy() {
         assert_eq!(classify_agent_reply("", &fwds()), CheckResult::Healthy);
         assert_eq!(classify_agent_reply("OK\n", &fwds()), CheckResult::Healthy);
+    }
+
+    #[test]
+    fn shell_single_quote_wraps_plain_string() {
+        assert_eq!(shell_single_quote("/tmp/S.gpg-agent"), "'/tmp/S.gpg-agent'");
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_embedded_quote() {
+        // it's → 'it'\''s' （閉じ・エスケープ・再開）
+        assert_eq!(shell_single_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn quoted_remote_paths_joins_all() {
+        let forwards = vec![
+            SocketForward {
+                remote_path: "/a".into(),
+                local_path: "/x".into(),
+            },
+            SocketForward {
+                remote_path: "/b b".into(),
+                local_path: "/y".into(),
+            },
+        ];
+        assert_eq!(quoted_remote_paths(&forwards), "'/a' '/b b'");
     }
 }

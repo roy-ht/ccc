@@ -245,6 +245,7 @@ pub fn run() {
             forwards::forwards_list,
             forwards::forwards_add,
             forwards::forwards_remove,
+            agent_socket::get_gpg_forward_status,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
