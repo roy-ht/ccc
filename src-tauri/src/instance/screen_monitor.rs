@@ -117,7 +117,9 @@ impl ScreenMonitor {
             self.parser.screen_mut().set_size(rows, cols);
         }));
         if result.is_err() {
-            eprintln!("[ccc] vt100 parser panicked on resize, resetting screen monitor ({rows}x{cols})");
+            eprintln!(
+                "[ccc] vt100 parser panicked on resize, resetting screen monitor ({rows}x{cols})"
+            );
             self.parser = vt100::Parser::new(rows, cols, 0);
         }
         // サイズ変更直後は崩れた中間状態があり得るので安定カウントをリセット

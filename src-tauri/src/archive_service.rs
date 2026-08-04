@@ -212,12 +212,7 @@ impl ArchiveService {
                         // ingest 完了直後、現在の session_id について summary を引き直し、
                         // 該当インスタンスのサイドバー表示を更新する（Local/Remote 共通経路）。
                         if let Some(sid) = session_id {
-                            refresh_session_title(
-                                &conn,
-                                &writer_infos,
-                                &writer_app_handle,
-                                sid,
-                            );
+                            refresh_session_title(&conn, &writer_infos, &writer_app_handle, sid);
                         }
                         // SessionEnd でそのプロファイルのメモリを保全（揮発前のスナップショット）。
                         if j.hook_event == "SessionEnd" {

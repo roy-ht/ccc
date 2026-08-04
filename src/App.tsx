@@ -417,6 +417,7 @@ function App() {
               fontSize={settings.display.font_size}
               colorTheme={settings.display.color_theme}
               reconnectEpoch={reconnectEpochs[s.id] ?? 0}
+              useWebgl={settings.display.use_webgl ?? true}
               onData={handleData}
               onResize={handleResize}
               onReady={handleTerminalReady}

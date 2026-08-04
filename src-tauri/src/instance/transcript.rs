@@ -440,7 +440,6 @@ mod tests {
 
     // ── read_tail 単体テスト ──────────────────────────────────────────────
 
-
     #[test]
     fn read_tail_returns_whole_when_smaller_than_max() {
         let path = write_jsonl(&[json!({"a": 1}), json!({"b": 2})]);

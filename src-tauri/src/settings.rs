@@ -25,6 +25,11 @@ pub struct DisplaySettings {
     /// サイドバーの状態メッセージ表示行数（高さ固定、はみ出しは clip）
     #[serde(default = "default_status_message_lines")]
     pub status_message_lines: u8,
+    /// ターミナルの WebGL レンダラを使うか。WKWebView の WebGL 合成に不具合がある
+    /// 環境（例: macOS 26.5 の描画回帰 = xterm.js#5816。テキスト選択位置のずれ・
+    /// 描画乱れとして現れる）向けの逃げ道として false = DOM レンダラに切替できる。
+    #[serde(default = "default_use_webgl")]
+    pub use_webgl: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +82,10 @@ fn default_status_message_lines() -> u8 {
     2
 }
 
+fn default_use_webgl() -> bool {
+    true
+}
+
 fn default_command() -> String {
     "claude".to_string()
 }
@@ -93,6 +102,7 @@ impl Default for DisplaySettings {
             color_theme: default_color_theme(),
             scrollback_lines: default_scrollback_lines(),
             status_message_lines: default_status_message_lines(),
+            use_webgl: default_use_webgl(),
         }
     }
 }
@@ -189,5 +199,7 @@ mod tests {
         }"#;
         let settings: AppSettings = serde_json::from_str(json).unwrap();
         assert_eq!(settings.connections[0].agent_profile, "default");
+        // use_webgl フィールドが無い旧設定は既定 true にフォールバックする
+        assert!(settings.display.use_webgl);
     }
 }

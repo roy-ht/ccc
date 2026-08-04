@@ -46,7 +46,9 @@ fn print_help() {
   ccc-ssh down <host>                   master を安全に終了（-O exit。無応答なら kill まで行う）
   ccc-ssh heal <host>                   強制的にリモート forward socket を張り直す（gpg forward が
                                         「check は通るのに実際は切れている」ケース対応。健全な forward
-                                        も一瞬切断されて即再バインドされます）
+                                        も一瞬切断されて即再バインドされます）。mux で直らない場合
+                                        （master 起動時に bind 失敗した forward）は master を世代交代
+                                        （-O stop → 再確立。既存セッションは維持）して張り直します
 
 pre-connect フックは網断で half-open になった master も検知し、自動で畳んで
 再確立します（ユーザー ControlMaster 設定時は ssh -N -f で復旧）。
@@ -173,7 +175,11 @@ fn pre_connect_hook(host: &str) {
         }
     };
     preflight_master(host, &log);
-    agent_socket::ensure_agent_forward(host, false, &log);
+    // gpg forward の check → 修復。mux で直らない場合（master 起動時に bind 失敗した
+    // config RemoteForward）は、ユーザー CM モードなら master 世代交代（-O stop →
+    // ssh -N -f。既存セッションは維持）まで自動で行う。世代ゲート + 再確立
+    // クールダウン付きなので、接続のたびに重い処理が連発することはない。
+    agent_socket::heal_agent_forward(host, false, true, &log);
     forwards::sync_ledger(host);
 }
 
@@ -396,17 +402,30 @@ fn cmd_heal(args: &[String]) -> i32 {
     //    直後の check が Broken を返し repair の -O cancel/-O forward -R が走って
     //    forward が確実に張り直される。健全な forward も一瞬切断されるが、直後の
     //    repair で数百 ms〜数秒で復元する（gpg 操作中は再試行を求む）
-    // 3. ensure_agent_forward(force=true): 世代ゲートをバイパスして check → repair
+    // 3. heal_agent_forward(force=true, cooldown 無視): check → mux repair →
+    //    それでも Broken なら master 世代交代（-O stop → ssh -N -f）→ 再 check。
+    //    mux repair は「master 起動時に bind 失敗した config RemoteForward」を
+    //    復旧できない（mux の重複検出で再要求が no-op になる）ため、世代交代が
+    //    唯一の修復手段になるケースがある
     // 4. sync_ledger: 台帳の port forward をリプレイ
     preflight_master(host, &stderr_log);
     agent_socket::cleanup_stale_remote_sockets(host, &stderr_log);
-    let healthy = agent_socket::ensure_agent_forward(host, true, &stderr_log);
+    let outcome = agent_socket::heal_agent_forward(host, true, false, &stderr_log);
     forwards::sync_ledger(host);
-    if healthy {
-        println!("OK");
-        0
-    } else {
-        1
+    match outcome {
+        agent_socket::HealOutcome::Healthy | agent_socket::HealOutcome::Indeterminate => {
+            println!("OK");
+            0
+        }
+        agent_socket::HealOutcome::NeedsMasterRebuild => {
+            eprintln!(
+                "ccc-ssh: mux では修復できず、ccc 専用 master のため世代交代は GUI が行います。\n\
+                 ccc GUI が起動中なら 60 秒以内の監視サイクルで自動復旧します。\n\
+                 今すぐ直したい場合は GUI でインスタンスを再接続してください。"
+            );
+            1
+        }
+        agent_socket::HealOutcome::Failed => 1,
     }
 }
 
@@ -449,7 +468,10 @@ mod tests {
 
     #[test]
     fn guess_plain_host() {
-        assert_eq!(guess_destination(&v(&["dev-host"])).as_deref(), Some("dev-host"));
+        assert_eq!(
+            guess_destination(&v(&["dev-host"])).as_deref(),
+            Some("dev-host")
+        );
         assert_eq!(
             guess_destination(&v(&["user@dev-host", "ls"])).as_deref(),
             Some("dev-host")

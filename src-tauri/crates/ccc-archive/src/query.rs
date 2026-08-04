@@ -624,7 +624,10 @@ mod tests {
             "INSERT INTO sessions(session_id, cwd, started_at, ended_at) VALUES ('s_many','/w/ccc',10,20)",
             [],
         ).unwrap();
-        for (i, t) in ["設計の話", "設計のレビュー", "設計と実装"].iter().enumerate() {
+        for (i, t) in ["設計の話", "設計のレビュー", "設計と実装"]
+            .iter()
+            .enumerate()
+        {
             conn.execute(
                 "INSERT INTO messages(session_id, uuid, seq, role, text) VALUES ('s_many',?1,?2,'user',?3)",
                 rusqlite::params![format!("m{i}"), i as i64, t],

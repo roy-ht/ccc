@@ -80,6 +80,7 @@ function DisplaySettingsPanel({
   );
   const [scrollbackLines, setScrollbackLines] = useState(String(settings.display.scrollback_lines ?? 1000));
   const [statusMessageLines, setStatusMessageLines] = useState(String(settings.display.status_message_lines ?? 2));
+  const [useWebgl, setUseWebgl] = useState(settings.display.use_webgl ?? true);
   const [systemFonts, setSystemFonts] = useState<string[]>([]);
   const [showFontList, setShowFontList] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -97,7 +98,8 @@ function DisplaySettingsPanel({
     );
     setScrollbackLines(String(settings.display.scrollback_lines ?? 1000));
     setStatusMessageLines(String(settings.display.status_message_lines ?? 2));
-  }, [settings.display.font_family, settings.display.font_size, settings.display.color_theme, settings.display.scrollback_lines, settings.display.status_message_lines]);
+    setUseWebgl(settings.display.use_webgl ?? true);
+  }, [settings.display.font_family, settings.display.font_size, settings.display.color_theme, settings.display.scrollback_lines, settings.display.status_message_lines, settings.display.use_webgl]);
 
   const query = fontFamily.toLowerCase().replace(/['"]/g, "").split(",")[0].trim();
   const filteredFonts = systemFonts.filter((f) =>
@@ -126,10 +128,11 @@ function DisplaySettingsPanel({
           Number.isFinite(msgLines) && msgLines >= 1 && msgLines <= 10
             ? msgLines
             : settings.display.status_message_lines,
+        use_webgl: useWebgl,
       },
     };
     await onSave(updated);
-  }, [fontFamily, fontSize, colorTheme, scrollbackLines, statusMessageLines, settings, onSave]);
+  }, [fontFamily, fontSize, colorTheme, scrollbackLines, statusMessageLines, useWebgl, settings, onSave]);
 
   return (
     <div className="settings-panel">
@@ -195,6 +198,22 @@ function DisplaySettingsPanel({
           </option>
         ))}
       </select>
+
+      <label className="settings-label">
+        GPU レンダリング（WebGL）
+        <span className="settings-hint">
+          テキスト選択位置のずれ・描画乱れが出る場合はオフ（DOM レンダラに切替。即時反映）
+        </span>
+      </label>
+      <label className="settings-toggle">
+        <input
+          type="checkbox"
+          checked={useWebgl}
+          onChange={(e) => setUseWebgl(e.target.checked)}
+          onFocus={() => setShowFontList(false)}
+        />
+        WebGL レンダラを使用する
+      </label>
 
       <label className="settings-label">
         復帰時スクロールバック復元行数

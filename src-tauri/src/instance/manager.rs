@@ -231,13 +231,20 @@ impl InstanceManager {
     ///
     /// - probe は `ccc_sshkit::agent_socket::probe_agent_forward`（既存 `check` 相当、
     ///   世代ゲートなし）。コストは mux 経由 1 コマンド実行で ~100–200ms
-    /// - broken 検知時: `ensure_agent_forward(force=true)` を呼び、内部の
-    ///   `repair`（gpgconf --kill + rm -f + -O cancel/-O forward -R）に修復させる。
-    ///   クールダウンは掛けない（ユーザー明示要望）。ストーム防止は後段の check → repair
-    ///   で「healthy に戻ったら repair をスキップする」冪等性に依拠
+    /// - broken 検知時: `heal_agent_forward(force=true)` を呼ぶ。内部で mux repair
+    ///   （gpgconf --kill + rm -f + -O cancel/-O forward -R）→ 直らなければ master
+    ///   世代交代まで行う（mux repair は「master 起動時に bind 失敗した config
+    ///   RemoteForward」を復旧できないため。force=true は世代ゲートに阻まれて
+    ///   heal 自体が no-op になるのを防ぐ）。世代交代のみ liveness のクールダウンで
+    ///   ストーム防止する
+    /// - ccc 専用 master で世代交代が必要な場合（`NeedsMasterRebuild`）は、hook
+    ///   逆転送込みの確立パス `ensure_remote_master` でここから立て直す。旧 master が
+    ///   リモート hook ポートを握ったままだと新 master が bind できないため
+    ///   `-O stop` ではなく teardown（-O exit）を使う（resilience パスと同じ流儀。
+    ///   PTY は切れるが tmux + pane-died 検知の再接続で保全される）
     /// - 状態遷移（前回と異なる）で Tauri event `gpg-forward-status-changed` を emit
     async fn probe_and_maybe_heal(&self, host_alias: &str) {
-        use ccc_sshkit::agent_socket::{self, ForwardHealth};
+        use ccc_sshkit::agent_socket::{self, ForwardHealth, HealOutcome};
 
         let host = host_alias.to_string();
         let health = tokio::task::spawn_blocking(move || {
@@ -250,17 +257,43 @@ impl InstanceManager {
         let previous = self.forward_status.insert(host_alias.to_string(), health);
         let transitioned = previous != Some(health);
 
-        // broken なら無条件自動 heal（クールダウンなし）
+        // broken なら無条件自動 heal
         let auto_heal_triggered = matches!(health, ForwardHealth::Broken);
         if auto_heal_triggered {
-            eprintln!(
-                "[ccc] [monitor] {host_alias}: gpg forward broken 検知 → 自動 heal 発火"
-            );
+            eprintln!("[ccc] [monitor] {host_alias}: gpg forward broken 検知 → 自動 heal 発火");
             let host = host_alias.to_string();
-            let _ = tokio::task::spawn_blocking(move || {
-                crate::agent_socket::ensure_agent_forward(&host, None);
+            let outcome = tokio::task::spawn_blocking(move || {
+                agent_socket::heal_agent_forward(&host, true, true, &|msg| eprintln!("[ccc] {msg}"))
             })
-            .await;
+            .await
+            .unwrap_or(HealOutcome::Failed);
+
+            if outcome == HealOutcome::NeedsMasterRebuild {
+                eprintln!("[ccc] [monitor] {host_alias}: mux では修復不能 → ccc master を再確立");
+                {
+                    let host = host_alias.to_string();
+                    let pid = ccc_sshkit::agent_socket::last_healthy_pid(host_alias);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        ccc_sshkit::liveness::teardown_master(&host, pid, &|msg| {
+                            eprintln!("[ccc] {msg}")
+                        })
+                    })
+                    .await;
+                }
+                match self.ensure_remote_master(host_alias, None).await {
+                    Ok(_) => {
+                        // 新世代 master での bind 結果を実測して gate を更新する
+                        let host = host_alias.to_string();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            crate::agent_socket::ensure_agent_forward(&host, None);
+                        })
+                        .await;
+                    }
+                    Err(e) => eprintln!(
+                        "[ccc] [monitor] {host_alias}: master 再確立失敗（次サイクルで再試行）: {e}"
+                    ),
+                }
+            }
             // heal 後の状態を再プローブして反映（成功していれば healthy に戻る）
             let host = host_alias.to_string();
             let post = tokio::task::spawn_blocking(move || {
@@ -1469,7 +1502,9 @@ impl InstanceManager {
         // 描画の整合が取れないため。
         if let Some((rows, cols)) = self.infos.get(id).and_then(|i| i.last_size) {
             if let Err(e) = instance.resize(rows, cols).await {
-                eprintln!("[ccc] {id}: reattach_local 後の last_size 適用に失敗 ({rows}x{cols}): {e}");
+                eprintln!(
+                    "[ccc] {id}: reattach_local 後の last_size 適用に失敗 ({rows}x{cols}): {e}"
+                );
             }
         }
 
@@ -1684,17 +1719,16 @@ impl InstanceManager {
                 );
 
                 let dir = info.directory.clone().unwrap_or_default();
-                let instance = PtyInstance::spawn_local_shell(
-                    &agent_session,
-                    &group_session,
-                    &dir,
-                    raw_tx,
-                )
-                .map_err(|e| {
-                    eprintln!("[ccc] ensure_shell_started({id}): spawn_local_shell 失敗: {e}");
-                    format!("shell PTY 起動に失敗: {e}")
-                })?;
-                self.shell_broadcasts.insert(id.to_string(), bcast_tx.clone());
+                let instance =
+                    PtyInstance::spawn_local_shell(&agent_session, &group_session, &dir, raw_tx)
+                        .map_err(|e| {
+                            eprintln!(
+                                "[ccc] ensure_shell_started({id}): spawn_local_shell 失敗: {e}"
+                            );
+                            format!("shell PTY 起動に失敗: {e}")
+                        })?;
+                self.shell_broadcasts
+                    .insert(id.to_string(), bcast_tx.clone());
                 self.spawn_shell_relay(id.to_string(), raw_rx, bcast_tx);
                 self.shell_instances.insert(id.to_string(), instance);
                 eprintln!("[ccc] ensure_shell_started({id}): 起動完了 (local)");
@@ -1713,12 +1747,9 @@ impl InstanceManager {
                         eprintln!("[ccc] ensure_shell_started({id}): master 確立失敗: {e}");
                         format!("ssh ControlMaster の確立に失敗: {e}")
                     })?;
-                let ssh_args = ssh_config::build_slave_ssh_args(
-                    &host_alias,
-                    ccc_master,
-                    self.hook_port(),
-                )
-                .map_err(|e| format!("ssh 引数構築に失敗: {e}"))?;
+                let ssh_args =
+                    ssh_config::build_slave_ssh_args(&host_alias, ccc_master, self.hook_port())
+                        .map_err(|e| format!("ssh 引数構築に失敗: {e}"))?;
 
                 let (instance, ready_rx) = PtyInstance::spawn_remote_shell(
                     &ssh_args,
@@ -1733,7 +1764,8 @@ impl InstanceManager {
                     format!("shell PTY 起動に失敗: {e}")
                 })?;
 
-                self.shell_broadcasts.insert(id.to_string(), bcast_tx.clone());
+                self.shell_broadcasts
+                    .insert(id.to_string(), bcast_tx.clone());
                 self.spawn_shell_relay(id.to_string(), raw_rx, bcast_tx);
 
                 await_ssh_ready(ready_rx, log_path.as_deref(), "ensure_shell").await?;

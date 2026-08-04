@@ -29,7 +29,8 @@ interface Props {
    * WebGL レンダラを使うか。default true。
    * 同一 WKWebView 上で WebGL canvas が複数あるとウィンドウサイズによって描画破綻する
    * 既存の問題（v0.8.1 以前から）があり、Shell 用は false を渡して DOM レンダラに倒す。
-   * key 変更を跨いだ動的切替は想定しない（mount 時に 1 度だけ反映）。
+   * true でも実際に WebGL を attach するのは**表示中のパネルだけ**（単一 canvas
+   * ポリシー。下の attach/detach 参照）。設定変更による動的切替にも追従する。
    */
   useWebgl?: boolean;
   onData: (instanceId: InstanceId, data: Uint8Array) => void;
@@ -41,7 +42,7 @@ export function TerminalPanel({ instanceId, isVisible, fontFamily, fontSize, col
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
-  // WebGL 利用時のみセット。リサイズ後に glyph atlas を焼き直すために保持する。
+  // 表示中に WebGL を attach しているときのみセット（単一 canvas ポリシー）。
   const webglAddonRef = useRef<WebglAddon | null>(null);
   const needsInitialResizeRef = useRef(true);
 
@@ -49,9 +50,54 @@ export function TerminalPanel({ instanceId, isVisible, fontFamily, fontSize, col
   const onDataRef = useRef(onData);
   const onResizeRef = useRef(onResize);
   const onReadyRef = useRef(onReady);
+  const isVisibleRef = useRef(isVisible);
   useEffect(() => { onDataRef.current = onData; }, [onData]);
   useEffect(() => { onResizeRef.current = onResize; }, [onResize]);
   useEffect(() => { onReadyRef.current = onReady; }, [onReady]);
+  useEffect(() => { isVisibleRef.current = isVisible; }, [isVisible]);
+
+  // ─── WebGL レンダラの単一 canvas ポリシー ─────────────────────────────────
+  //
+  // WKWebView 上に WebGL canvas が複数共存すると GPU 合成が壊れる既知の問題がある
+  // （v0.8.1 以前から。Shell タブを DOM レンダラに逃がした理由と同じ）。canvas の
+  // 見た目だけがずれる形で壊れると、DOM 座標基準のマウスヒットテスト（テキスト選択）
+  // と描画位置が食い違い、「マウスが指している場所と選択範囲がずれる」症状になる。
+  // さらに macOS 26.5 の WebKit には WebGL 描画の回帰（xterm.js#5816）もある。
+  //
+  // 対策として WebGL は**表示中のパネル 1 枚だけ**に attach し、非表示化で即 detach
+  // する。非表示中は xterm 標準の DOM レンダラに戻るが、xterm は画面外
+  // （display:none）では描画を停止するため CPU コストは増えない。これで WebGL
+  // コンテキスト数がインスタンス数・リサイズ回数に比例して増えることもなくなる
+  // （WKWebView は同時コンテキスト数に上限があり、超えると古いものが強制喪失する）。
+  const attachWebgl = () => {
+    const term = termRef.current;
+    if (!useWebgl || !term || webglAddonRef.current) return;
+    try {
+      const addon = new WebglAddon();
+      addon.onContextLoss(() => {
+        // コンテキスト喪失（WKWebView 側の強制解放等）。DOM レンダラに戻して
+        // 継続し、次の表示切替/リサイズで再 attach される。ref のクリアを忘れると
+        // 以後の attach が「既に居る」と誤認してスキップし続けるので必ず消す。
+        console.warn("[ccc] WebGL コンテキスト喪失（DOM レンダラで継続）");
+        addon.dispose();
+        if (webglAddonRef.current === addon) webglAddonRef.current = null;
+      });
+      term.loadAddon(addon);
+      webglAddonRef.current = addon;
+    } catch (e) {
+      console.warn("[ccc] WebGL レンダラの初期化に失敗（DOM レンダラで継続）:", e);
+    }
+  };
+  const detachWebgl = () => {
+    const addon = webglAddonRef.current;
+    webglAddonRef.current = null;
+    if (!addon) return;
+    try {
+      addon.dispose();
+    } catch {
+      // すでに dispose 済み等は無視
+    }
+  };
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -96,20 +142,13 @@ export function TerminalPanel({ instanceId, isVisible, fontFamily, fontSize, col
       const fitAddon = new FitAddon();
       term.loadAddon(fitAddon);
       term.open(containerRef.current);
+      termRef.current = term;
+      fitAddonRef.current = fitAddon;
 
       // GPU レンダラ（rescaleOverlappingGlyphs に必須。DOM レンダラでは効かない）。
-      // WebGL コンテキストが取れない/失われた場合は DOM レンダラに戻して継続する。
-      // useWebgl=false が渡されている時は明示的に DOM レンダラに倒す（Shell タブ用）。
-      if (useWebgl) {
-        try {
-          const webglAddon = new WebglAddon();
-          webglAddon.onContextLoss(() => webglAddon.dispose());
-          term.loadAddon(webglAddon);
-          webglAddonRef.current = webglAddon;
-        } catch (e) {
-          console.warn("[ccc] WebGL レンダラの初期化に失敗（DOM レンダラで継続）:", e);
-        }
-      }
+      // 単一 canvas ポリシーにより表示中のパネルのみ attach する（非表示で mount
+      // された復元インスタンスは、最初に表示された時点で attach される）。
+      if (isVisibleRef.current) attachWebgl();
 
       requestAnimationFrame(() => { fitAddon.fit(); });
 
@@ -152,9 +191,6 @@ export function TerminalPanel({ instanceId, isVisible, fontFamily, fontSize, col
         return true;
       });
 
-      termRef.current = term;
-      fitAddonRef.current = fitAddon;
-
       // PTY出力 → xterm.js に書き込む関数を登録（バイナリ直接渡し）
       // 初回データ受信時に擬似リサイズを発火し、PTY サイズをウィンドウに同期させる。
       // reconnect 時はバックエンドの PTY が新規生成され default 80x24 になるため、
@@ -174,7 +210,7 @@ export function TerminalPanel({ instanceId, isVisible, fontFamily, fontSize, col
 
       teardown = () => {
         cleanup();
-        webglAddonRef.current = null;
+        detachWebgl();
         term.dispose();
       };
     };
@@ -191,10 +227,12 @@ export function TerminalPanel({ instanceId, isVisible, fontFamily, fontSize, col
   // マウスドラッグ中は ResizeObserver が毎フレーム発火する。連続呼び出しは
   // PTY/tmux/claude の SIGWINCH 伝播が追いつかず描画破綻するので 120ms trailing debounce。
   //
-  // WebGL レンダラは scrollback が多い状態（claude code は alternate screen 不使用設計のため
-  // 全画面 redraw がそのまま scrollback に積まれる）で resize 時に glyph atlas / canvas
-  // 内部解像度の追従に失敗する既知の症状がある。clearTextureAtlas() 単発では足りないので
-  // WebglAddon を dispose → 新規 attach して内部 state をリセットする。
+  // WebGL レンダラは resize 時に glyph atlas / canvas 内部解像度の追従に失敗する
+  // 既知の症状がある。clearTextureAtlas() 単発では足りないので WebglAddon を
+  // dispose → 新規 attach して内部 state をリセットする。ただし対象は**表示中の
+  // パネルのみ**: 旧実装は非表示パネルまで全数 dispose→再生成しており、
+  // インスタンス数 × リサイズ回数だけ WebGL コンテキストを浪費して WKWebView の
+  // 同時コンテキスト上限で強制喪失（＝時間経過での描画・選択異常）を誘発していた。
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | null = null;
     const observer = new ResizeObserver(() => {
@@ -205,21 +243,9 @@ export function TerminalPanel({ instanceId, isVisible, fontFamily, fontSize, col
         if (!term) return;
         fitAddonRef.current?.fit();
 
-        if (useWebgl && webglAddonRef.current) {
-          try {
-            webglAddonRef.current.dispose();
-          } catch {
-            // すでに dispose 済み等は無視
-          }
-          webglAddonRef.current = null;
-          try {
-            const next = new WebglAddon();
-            next.onContextLoss(() => next.dispose());
-            term.loadAddon(next);
-            webglAddonRef.current = next;
-          } catch (e) {
-            console.warn("[ccc] WebGL レンダラの再 attach に失敗（DOM レンダラで継続）:", e);
-          }
+        if (useWebgl && isVisibleRef.current && webglAddonRef.current) {
+          detachWebgl();
+          attachWebgl();
         }
         term.refresh(0, term.rows - 1);
       }, 120);
@@ -233,17 +259,29 @@ export function TerminalPanel({ instanceId, isVisible, fontFamily, fontSize, col
     };
   }, [useWebgl]);
 
-  // 表示時にフィット再計算してフォーカス（ダブルRAFでレイアウト確定を待つ）
+  // 表示切替（単一 canvas ポリシーの要）:
+  // - 非表示化: WebGL を即 detach（DOM レンダラに戻す。画面外なので描画コストなし）
+  // - 表示化: レイアウト確定（ダブル RAF）後に WebGL を attach → fit → 全再描画 →
+  //   フォーカス。useWebgl 設定の動的切替もここで反映される
   useEffect(() => {
-    if (!isVisible) return;
+    if (!isVisible) {
+      detachWebgl();
+      return;
+    }
+    if (!useWebgl) detachWebgl();
     let id = requestAnimationFrame(() => {
       id = requestAnimationFrame(() => {
+        attachWebgl();
         fitAddonRef.current?.fit();
-        termRef.current?.focus();
+        const term = termRef.current;
+        if (term) {
+          term.refresh(0, term.rows - 1);
+          term.focus();
+        }
       });
     });
     return () => cancelAnimationFrame(id);
-  }, [isVisible]);
+  }, [isVisible, useWebgl]);
 
   // reconnect 完了時の再同期。新規 PTY は default 80x24 で生成されるため、
   // バックエンド側の last_size 適用に加えて、フロントからも現サイズを再 push する。

@@ -102,6 +102,12 @@ export interface DisplaySettings {
   scrollback_lines: number;
   /** サイドバーの状態メッセージ表示行数（固定高さ、はみ出しは clip） */
   status_message_lines: number;
+  /**
+   * ターミナルの WebGL レンダラを使うか（既定 true）。WKWebView の WebGL 合成に
+   * 不具合がある環境（テキスト選択位置のずれ・描画乱れ）では false で DOM レンダラに
+   * 切替できる。
+   */
+  use_webgl: boolean;
 }
 
 export interface RemoteConfig {

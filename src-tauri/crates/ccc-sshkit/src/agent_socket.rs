@@ -388,6 +388,11 @@ fn repair(host_alias: &str, mux_base: &[String], forwards: &[SocketForward], log
 
     // 2. mux 経由で forward だけ再要求（cancel は失敗してよい: 元々張れていない場合がある）。
     //    -O forward -R はサーバ応答を待つため、half-open では MUX_OP_TIMEOUT で打ち切る。
+    //
+    //    注意: cancel が失敗した場合（= master 起動時に bind 失敗した config 由来
+    //    forward）、mux master は spec を options 重複と判定し、-O forward を
+    //    「成功」と返しつつサーバへ要求を送らない（no-op）。この場合の最終判定と
+    //    エスカレーションは呼び出し側の check → `heal_agent_forward` が担う。
     for fwd in forwards {
         let spec = fwd.to_r_arg();
         let _ = run_with_timeout(
@@ -404,7 +409,9 @@ fn repair(host_alias: &str, mux_base: &[String], forwards: &[SocketForward], log
         );
         match out {
             Ok(o) if o.success() => {
-                log(&format!("[agent-socket] {host_alias}: 再要求 OK: {spec}"));
+                log(&format!(
+                    "[agent-socket] {host_alias}: 再要求を受理: {spec}（実効性は直後の check で確認）"
+                ));
             }
             Ok(o) if o.timed_out => {
                 log(&format!(
@@ -424,6 +431,20 @@ fn repair(host_alias: &str, mux_base: &[String], forwards: &[SocketForward], log
     }
 }
 
+/// `ensure_agent_forward_detailed` の結果分類。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnsureOutcome {
+    /// 健全（check OK / 世代ゲート skip / mux repair で復旧）
+    Healthy,
+    /// 判定不能（NoGpg / Unreachable / forward 設定なし / ssh -G 失敗）。
+    /// 呼び出し側の起動をブロックしないため「問題なし」扱いにしてよい
+    Indeterminate,
+    /// mux repair（-O cancel/-O forward -R）でも Broken のまま。
+    /// master 起動時に bind 失敗した config RemoteForward は mux の重複検出で
+    /// 再要求が no-op になるため、この状態は master 世代交代でしか直らない
+    StillBroken,
+}
+
 /// チェック＋修復のエントリポイント。戻り値は「最終的に健全か」
 /// （NoGpg / Unreachable / forward 設定なし は「判定不能 = true 扱い」で返す。
 /// 呼び出し側が起動をブロックしない設計のため）。
@@ -433,22 +454,28 @@ fn repair(host_alias: &str, mux_base: &[String], forwards: &[SocketForward], log
 ///
 /// config に unix ソケットの RemoteForward が無いホストでは何もしない。
 pub fn ensure_agent_forward(host_alias: &str, force: bool, log: Log) -> bool {
+    ensure_agent_forward_detailed(host_alias, force, log) != EnsureOutcome::StillBroken
+}
+
+/// `ensure_agent_forward` の詳細版。「修復失敗」（= 世代交代エスカレーションの
+/// 出番）を判定不能と区別して返す。
+pub fn ensure_agent_forward_detailed(host_alias: &str, force: bool, log: Log) -> EnsureOutcome {
     let forwards = match ssh_config::run_ssh_g(host_alias) {
         Ok(out) => parse_socket_remote_forwards(&out),
         Err(e) => {
             log(&format!("[agent-socket] {host_alias}: ssh -G 失敗: {e}"));
-            return true;
+            return EnsureOutcome::Indeterminate;
         }
     };
     if forwards.is_empty() {
-        return true;
+        return EnsureOutcome::Indeterminate;
     }
 
     let mux_base = match mux_base_args(host_alias) {
         Ok(v) => v,
         Err(e) => {
             log(&format!("[agent-socket] {host_alias}: {e}"));
-            return true;
+            return EnsureOutcome::Indeterminate;
         }
     };
 
@@ -463,7 +490,7 @@ pub fn ensure_agent_forward(host_alias: &str, force: bool, log: Log) -> bool {
                 log(&format!(
                     "[agent-socket] {host_alias}: master 世代不変 (pid={pid})、チェック省略"
                 ));
-                return true;
+                return EnsureOutcome::Healthy;
             }
         }
     } else {
@@ -485,35 +512,116 @@ pub fn ensure_agent_forward(host_alias: &str, force: bool, log: Log) -> bool {
         CheckResult::Healthy => {
             log(&format!("[agent-socket] {host_alias}: gpg agent 疎通 OK"));
             mark_healthy(log);
-            true
+            EnsureOutcome::Healthy
         }
         CheckResult::NoGpg => {
             log(&format!(
                 "[agent-socket] {host_alias}: gpg-connect-agent 無し（チェックをスキップ）"
             ));
-            true
+            EnsureOutcome::Indeterminate
         }
         CheckResult::Unreachable => {
             log(&format!(
                 "[agent-socket] {host_alias}: リモート実行不可（チェックをスキップ）"
             ));
-            true
+            EnsureOutcome::Indeterminate
         }
         CheckResult::Broken => {
             log(&format!(
                 "[agent-socket] {host_alias}: gpg agent forward 不調 → 自動修復を試行"
             ));
             repair(host_alias, &mux_base, &forwards, log);
-            let healthy = check(host_alias, &mux_base, &forwards) == CheckResult::Healthy;
-            if healthy {
+            if check(host_alias, &mux_base, &forwards) == CheckResult::Healthy {
                 mark_healthy(log);
                 log(&format!("[agent-socket] {host_alias}: 修復成功"));
+                EnsureOutcome::Healthy
             } else {
                 log(&format!(
-                    "[agent-socket] {host_alias}: 修復失敗（コマンドが gpg を要求する場合は失敗します）"
+                    "[agent-socket] {host_alias}: mux 経由の修復失敗（master 起動時に bind 失敗した \
+                     forward は mux では再要求できません）"
                 ));
+                EnsureOutcome::StillBroken
             }
-            healthy
+        }
+    }
+}
+
+// ─── 完全修復（mux repair + master 世代交代エスカレーション） ─────────────────
+
+/// [`heal_agent_forward`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealOutcome {
+    /// 健全（不調なし / mux repair / master 世代交代のいずれかで復旧）
+    Healthy,
+    /// 判定不能（forward 設定なし・gpg-connect-agent なし・リモート実行不可）
+    Indeterminate,
+    /// mux repair 不能かつ ccc 専用 master のため、世代交代は呼び出し側
+    /// （GUI の `ensure_remote_master`）に委ねる
+    NeedsMasterRebuild,
+    /// master 世代交代まで試みたが復旧できなかった
+    Failed,
+}
+
+/// check → mux repair → それでも Broken なら **master 世代交代** → 再 check、
+/// まで行う完全修復。
+///
+/// 世代交代が必要になる理由: OpenSSH の mux master は ssh config 由来の
+/// RemoteForward を `options.remote_forwards` に保持しており、`-O forward -R` の
+/// 再要求を**重複と判定してサーバへ送らず OK を返す**。master 起動時に bind が
+/// 失敗した forward は `-O cancel` も失敗して options から消えないため、
+/// mux 操作だけでは永遠に復旧できない（`repair` の「再要求 OK」ログが実際には
+/// no-op になる）。詳細は [`crate::liveness::replace_master_generation`]。
+///
+/// - `force_check = false`: 世代ゲートが有効（pre-connect フック向けの軽量経路）
+/// - `respect_cooldown = false`: 世代交代のクールダウンをバイパス
+///   （`ccc-ssh heal` のような明示要求向け。自動パスは true にする）
+/// - ユーザー ControlMaster 尊重モードでは世代交代（`-O stop` → `ssh -N -f`）
+///   まで自動で行う。ccc 専用 master（GUI 所有）は hook 逆転送の構成を GUI しか
+///   知らないため `NeedsMasterRebuild` を返して委ねる
+pub fn heal_agent_forward(
+    host_alias: &str,
+    force_check: bool,
+    respect_cooldown: bool,
+    log: Log,
+) -> HealOutcome {
+    match ensure_agent_forward_detailed(host_alias, force_check, log) {
+        EnsureOutcome::Healthy => return HealOutcome::Healthy,
+        EnsureOutcome::Indeterminate => return HealOutcome::Indeterminate,
+        EnsureOutcome::StillBroken => {}
+    }
+
+    if !ssh_config::user_has_control_master(host_alias).unwrap_or(false) {
+        log(&format!(
+            "[agent-socket] {host_alias}: 修復には master 世代交代が必要（ccc 専用 master のため \
+             GUI 側の再確立に委ねる）"
+        ));
+        return HealOutcome::NeedsMasterRebuild;
+    }
+
+    log(&format!(
+        "[agent-socket] {host_alias}: 修復のため master を世代交代します（既存セッションは維持）"
+    ));
+    if let Err(e) = crate::liveness::replace_master_generation(host_alias, respect_cooldown, log) {
+        log(&format!(
+            "[agent-socket] {host_alias}: master 世代交代に失敗（修復未完）: {e}"
+        ));
+        return HealOutcome::Failed;
+    }
+
+    // 新世代 master での実測が最終判定（ExitOnForwardFailure=no で確立しているため必須）
+    match ensure_agent_forward_detailed(host_alias, true, log) {
+        EnsureOutcome::Healthy => {
+            log(&format!(
+                "[agent-socket] {host_alias}: master 世代交代により修復成功"
+            ));
+            HealOutcome::Healthy
+        }
+        EnsureOutcome::Indeterminate => HealOutcome::Indeterminate,
+        EnsureOutcome::StillBroken => {
+            log(&format!(
+                "[agent-socket] {host_alias}: 世代交代後も不調（ローカル gpg-agent 側の問題の可能性）"
+            ));
+            HealOutcome::Failed
         }
     }
 }

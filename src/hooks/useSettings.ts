@@ -10,6 +10,7 @@ const DEFAULT_SETTINGS: AppSettings = {
     color_theme: DEFAULT_TERMINAL_THEME_ID,
     scrollback_lines: 1000,
     status_message_lines: 2,
+    use_webgl: true,
   },
   connections: [],
 };
