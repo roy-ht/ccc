@@ -1,0 +1,144 @@
+diff --git a/src/GlyphRenderer.ts b/src/GlyphRenderer.ts
+index 10c9ad7222db2e8f1d2fe8538a822dd26253363b..685c4049ad5be2eb990b1a0fa766a22fbd1858f3 100644
+--- a/src/GlyphRenderer.ts
++++ b/src/GlyphRenderer.ts
+@@ -356,7 +356,9 @@ export class GlyphRenderer extends Disposable {
+     gl.bindBuffer(gl.ARRAY_BUFFER, this._attributesBuffer);
+     gl.bufferData(gl.ARRAY_BUFFER, activeBuffer.subarray(0, bufferLength), gl.STREAM_DRAW);
+ 
+-    // Bind the atlas page texture if they have changed
++    // Bind the atlas page texture if they have changed. AtlasPage.version is globally
++    // monotonic, so a page object swap at the same index (which happens after a page merge)
++    // is detected by the same comparison.
+     for (let i = 0; i < this._atlas.pages.length; i++) {
+       if (this._atlas.pages[i].version !== this._atlasTextures[i].version) {
+         this._bindAtlasPageTexture(gl, this._atlas, i);
+@@ -369,6 +371,10 @@ export class GlyphRenderer extends Disposable {
+ 
+   public setAtlas(atlas: ITextureAtlas): void {
+     this._atlas = atlas;
++    this.invalidateAtlasTextures();
++  }
++
++  public invalidateAtlasTextures(): void {
+     for (const glTexture of this._atlasTextures) {
+       glTexture.version = -1;
+     }
+diff --git a/src/RectangleRenderer.ts b/src/RectangleRenderer.ts
+index 8ace9076e93ac9c9a4e4902ba43ccaf992c6488c..b01be9f880806753e8f5c403d0f7a04c45c2cc7b 100644
+--- a/src/RectangleRenderer.ts
++++ b/src/RectangleRenderer.ts
+@@ -336,8 +336,9 @@ export class RectangleRenderer extends Disposable {
+       }
+     }
+ 
+-    if (vertices.attributes.length < offset + 4) {
+-      vertices.attributes = expandFloat32Array(vertices.attributes, this._terminal.rows * this._terminal.cols * INDICES_PER_RECTANGLE);
++    if (vertices.attributes.length < offset + INDICES_PER_RECTANGLE) {
++      // +1 for the viewport-clear rectangle at offset 0.
++      vertices.attributes = expandFloat32Array(vertices.attributes, (this._terminal.rows * this._terminal.cols + 1) * INDICES_PER_RECTANGLE);
+     }
+     $x1 = startX * this._dimensions.device.cell.width;
+     $y1 = y * this._dimensions.device.cell.height;
+diff --git a/src/TextureAtlas.ts b/src/TextureAtlas.ts
+index 330c62758cc1358d3c2b649bfe84cfa4e765bc91..dfb19d07e091a9b82d485ce96c60e2f084e776a7 100644
+--- a/src/TextureAtlas.ts
++++ b/src/TextureAtlas.ts
+@@ -132,7 +132,9 @@ export class TextureAtlas implements ITextureAtlas {
+ 
+   private _requestClearModel = false;
+   public beginFrame(): boolean {
+-    return this._requestClearModel;
++    const result = this._requestClearModel;
++    this._requestClearModel = false;
++    return result;
+   }
+ 
+   public clearTexture(): void {
+@@ -181,7 +183,7 @@ export class TextureAtlas implements ITextureAtlas {
+ 
+       // Merge into the new page
+       const mergedPage = this._mergePages(mergingPages, mergedPageIndex);
+-      mergedPage.version++;
++      mergedPage.version = ++AtlasPage.nextVersion;
+ 
+       // Delete the pages, shifting glyph texture pages as needed
+       for (let i = sortedMergingPagesIndexes.length - 1; i >= 0; i--) {
+@@ -239,7 +241,7 @@ export class TextureAtlas implements ITextureAtlas {
+       for (const g of adjustingPage.glyphs) {
+         g.texturePage--;
+       }
+-      adjustingPage.version++;
++      adjustingPage.version = ++AtlasPage.nextVersion;
+     }
+   }
+ 
+@@ -916,7 +918,7 @@ export class TextureAtlas implements ITextureAtlas {
+       rasterizedGlyph.size.y
+     );
+     activePage.addGlyph(rasterizedGlyph);
+-    activePage.version++;
++    activePage.version = ++AtlasPage.nextVersion;
+ 
+     return rasterizedGlyph;
+   }
+@@ -1026,9 +1028,13 @@ class AtlasPage {
+   }
+ 
+   /**
+-   * Used to check whether the canvas of the atlas page has changed.
++   * Monotonically increasing across all atlas pages globally. Used to detect when the texture
++   * unit at a given index needs to be re-uploaded -- both for content changes within the same
++   * page and for a page object swap at the same index (which happens after a page merge,
++   * where a per-page counter could coincide with the previously-bound page's value).
+    */
+-  public version = 0;
++  public static nextVersion: number = 0;
++  public version = ++AtlasPage.nextVersion;
+ 
+   // Texture atlas current positioning data. The texture packing strategy used is to fill from
+   // left-to-right and top-to-bottom. When the glyph being written is less than half of the current
+@@ -1071,7 +1077,7 @@ class AtlasPage {
+     this.currentRow.y = 0;
+     this.currentRow.height = 0;
+     this.fixedRows.length = 0;
+-    this.version++;
++    this.version = ++AtlasPage.nextVersion;
+   }
+ }
+ 
+diff --git a/src/WebglRenderer.ts b/src/WebglRenderer.ts
+index e3a2d0c61fea03f95e88cb4bcc2fc98472f1b30c..09470a9a16ee83b224626598627d976321039e78 100644
+--- a/src/WebglRenderer.ts
++++ b/src/WebglRenderer.ts
+@@ -27,6 +27,10 @@ import { addDisposableListener } from 'vs/base/browser/dom';
+ import { combinedDisposable, Disposable, MutableDisposable, toDisposable } from 'vs/base/common/lifecycle';
+ import { createRenderDimensions } from 'browser/renderer/shared/RendererUtils';
+ 
++const enum Constants {
++  MERGE_RETRY_LIMIT = 32
++}
++
+ export class WebglRenderer extends Disposable implements IRenderer {
+   private _renderLayers: IRenderLayer[];
+   private _cursorBlinkStateManager: MutableDisposable<CursorBlinkStateManager> = new MutableDisposable();
+@@ -351,6 +355,19 @@ export class WebglRenderer extends Disposable implements IRenderer {
+       this._updateModel(start, end);
+     }
+ 
++    // A mid-update atlas page merge invalidates vertex data and may not bump the host
++    // page's version, so re-run the update and force a full texture rebind.
++    let merged = false;
++    let mergeRetries = 0;
++    while (this._charAtlas && this._glyphRenderer.value.beginFrame() && mergeRetries++ < Constants.MERGE_RETRY_LIMIT) {
++      merged = true;
++      this._clearModel(true);
++      this._updateModel(0, this._terminal.rows - 1);
++    }
++    if (merged) {
++      this._glyphRenderer.value.invalidateAtlasTextures();
++    }
++
+     // Render
+     this._rectangleRenderer.value.renderBackgrounds();
+     this._glyphRenderer.value.render(this._model);
