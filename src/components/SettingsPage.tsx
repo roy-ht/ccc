@@ -4,8 +4,9 @@ import { AppSettings, ConnectionPreset, PresetTarget, SshHost, CliToolStatus, In
 import { useClaudeProfiles } from "../hooks/useClaudeProfiles";
 import { TERMINAL_THEMES, DEFAULT_TERMINAL_THEME_ID } from "../constants";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { ForwardsPanel } from "./ForwardsPanel";
 
-type Category = "display" | "connections" | "tools";
+type Category = "display" | "connections" | "forwards" | "tools";
 
 interface Props {
   settings: AppSettings;
@@ -44,6 +45,12 @@ export function SettingsPage({ settings, onSave, onClose }: Props) {
             接続先設定
           </button>
           <button
+            className={`settings-nav-item${category === "forwards" ? " active" : ""}`}
+            onClick={() => setCategory("forwards")}
+          >
+            ポートフォワード
+          </button>
+          <button
             className={`settings-nav-item${category === "tools" ? " active" : ""}`}
             onClick={() => setCategory("tools")}
           >
@@ -57,6 +64,7 @@ export function SettingsPage({ settings, onSave, onClose }: Props) {
           {category === "connections" && (
             <ConnectionSettingsPanel settings={settings} onSave={onSave} />
           )}
+          {category === "forwards" && <ForwardsPanel />}
           {category === "tools" && <ToolsSettingsPanel />}
         </div>
       </div>

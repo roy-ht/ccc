@@ -3,8 +3,6 @@ import { MainTab } from "../types";
 interface Props {
   active: MainTab;
   onChange: (tab: MainTab) => void;
-  /** Forwards タブを表示するか（リモートインスタンスのみ true） */
-  showForwards: boolean;
 }
 
 const TABS: { id: MainTab; label: string }[] = [
@@ -16,15 +14,17 @@ const TABS: { id: MainTab; label: string }[] = [
   { id: "sessions", label: "Sessions" },
   { id: "memories", label: "Memories" },
   { id: "explorer", label: "Explorer" },
-  { id: "forwards", label: "Forwards" },
 ];
 
-/** 主画面上部のタブバー（Agent / Sessions / Memories / Explorer / Forwards）。 */
-export function MainTabs({ active, onChange, showForwards }: Props) {
-  const tabs = showForwards ? TABS : TABS.filter((t) => t.id !== "forwards");
+/// 主画面上部のタブバー（Agent / Terminal / Sessions / Memories / Explorer）。
+///
+/// forward 管理はここには置かない。インスタンスに紐づけると起動していないホストの
+/// forward が見えず、ホストを跨いだポート衝突を管理できないため、設定画面の
+/// 横断ビューへ移した。
+export function MainTabs({ active, onChange }: Props) {
   return (
     <div className="main-tabs" role="tablist">
-      {tabs.map((t) => (
+      {TABS.map((t) => (
         <button
           key={t.id}
           role="tab"

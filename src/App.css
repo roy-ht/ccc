@@ -3054,6 +3054,79 @@ html, body, #root {
   color: var(--danger);
 }
 
+/* ─── ホスト横断ビュー ─────────────────────────────────────────────────────── */
+
+/* 走査範囲トグル（ssh config 全ホストを含めるか） */
+.forwards-scope {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--text-muted);
+  cursor: pointer;
+  margin-left: auto;
+  margin-right: 8px;
+  white-space: nowrap;
+}
+
+.forwards-host-select {
+  max-width: 190px;
+}
+
+/* listen ポートを行頭に固定幅で置き、衝突を目視で拾いやすくする */
+.forwards-port-col {
+  font-family: var(--font-mono, monospace);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  min-width: 48px;
+  text-align: right;
+}
+
+.forwards-host-col {
+  font-size: 11px;
+  color: var(--text-muted);
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.forwards-conflict-banner {
+  margin: 8px 12px 0;
+  padding: 7px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--warn);
+  background: rgba(251, 146, 60, 0.1);
+  color: var(--warn);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.forwards-conflict {
+  box-shadow: inset 2px 0 0 var(--warn);
+}
+
+.badge-fwd-state-active {
+  background: rgba(16, 185, 129, 0.16);
+  color: var(--success);
+}
+
+.badge-fwd-state-blocked {
+  background: rgba(239, 68, 68, 0.16);
+  color: var(--danger);
+}
+
+.badge-fwd-state-inactive {
+  background: rgba(148, 163, 184, 0.16);
+  color: var(--text-muted);
+}
+
+.badge-fwd-conflict {
+  background: rgba(251, 146, 60, 0.2);
+  color: var(--warn);
+}
+
 .forwards-item-error {
   flex-basis: 100%;
   font-size: 12px;

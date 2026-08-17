@@ -583,7 +583,7 @@ dependencies = [
 
 [[package]]
 name = "ccc"
-version = "0.10.3"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -596,6 +596,7 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",

@@ -136,7 +136,9 @@ export interface AppSettings {
 // ─── アーカイブ（Sessions / Memories 主画面タブ） ──────────────────────────────
 
 /** 主画面のタブ。インスタンス切替時は常に terminal にリセットする。 */
-export type MainTab = "terminal" | "shell" | "sessions" | "memories" | "explorer" | "forwards";
+// forward の管理はインスタンスから切り離し、設定画面のホスト横断ビューへ一本化した
+// （起動していないホストの forward が見えず、ポート衝突を管理できなかったため）。
+export type MainTab = "terminal" | "shell" | "sessions" | "memories" | "explorer";
 
 /** セッション 1 件（`archive_list_sessions`）。Rust `SessionRow` と対応。 */
 export interface SessionRow {
@@ -273,4 +275,28 @@ export interface ForwardRow {
   stale: boolean;
   error?: string | null;
   deletable: boolean;
+}
+
+/**
+ * forward の実効状態。Rust `ForwardState` と対応。
+ * - active:   現 master に適用されている
+ * - blocked:  未適用で、listen ポートは別の何かが専有している
+ * - inactive: 未適用で、listen ポートは空いている
+ */
+export type ForwardState = "active" | "blocked" | "inactive";
+
+/**
+ * ホスト横断の一覧 1 行。Rust `GlobalForwardRow` と対応。
+ * `host_alias` は reserved 行のみ空文字（ccc 予約はホストに紐づかない）。
+ */
+export interface GlobalForwardRow {
+  host_alias: string;
+  spec: ForwardSpec;
+  origin: "ledger" | "config" | "reserved";
+  reverse: boolean;
+  state: ForwardState;
+  error?: string | null;
+  deletable: boolean;
+  /** 同じ listen ポートを別のホストも登録している */
+  conflict: boolean;
 }

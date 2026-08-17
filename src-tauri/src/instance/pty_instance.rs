@@ -20,9 +20,52 @@ pub struct HookEnv<'a> {
 
 /// PTY 上でプロセスを起動し、tmux 経由で I/O を行う共通インスタンス。
 /// ローカル ($SHELL -l) もリモート (ssh -t alias) も同じ構造。
+///
+/// # 子プロセスのライフサイクル
+///
+/// `PtyInstance` が drop されたら PTY 上の子プロセス (ローカル: ログインシェル →
+/// tmux クライアント / リモート: ssh) を必ず終了させる。
+///
+/// これが無いと、reconnect でインスタンスを差し替えても**旧 ssh が生き残る**。
+/// `try_clone_reader` / `take_writer` は master fd を dup するため、master を
+/// drop しても読み取りスレッドは EOF を受けず、旧 ssh は自分が死ぬまで動き続ける
+/// （半開き TCP なら ServerAlive の検知まで数十秒）。その間:
+///
+/// - 同じ tmux セッションにクライアントが 2 つぶら下がる
+/// - 旧 relay が同じ broadcast へ出力を流し続けて画面が二重化する
+/// - 旧 relay がいずれ発火して現行接続の status を Disconnected に踏み潰す
+///
+/// tmux セッション自体はサーバ側プロセスなので、クライアントを kill しても
+/// セッションは残る（detach 相当）。
 pub struct PtyInstance {
     writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
     master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+    /// 子プロセスへシグナルを送るハンドル。`wait` でブロックしている
+    /// 読み取りスレッドとは independent に kill できる。
+    killer: std::sync::Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
+}
+
+impl Drop for PtyInstance {
+    fn drop(&mut self) {
+        if let Ok(mut k) = self.killer.lock() {
+            // 既に終了済みなら Err になるだけで害はない。
+            let _ = k.kill();
+        }
+    }
+}
+
+/// 読み取りスレッド終了時に子プロセスを確実に reap するガード。
+///
+/// どの経路でスレッドを抜けても zombie を残さない。`wait` の前に `kill` を
+/// 呼ぶのは、PTY が生きたままスレッドだけ抜けるケース（broadcast 側が先に
+/// 閉じた等）で `wait` が永久にブロックするのを防ぐため。
+struct ChildReaper(Box<dyn portable_pty::Child + Send + Sync>);
+
+impl Drop for ChildReaper {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 /// `start_pty` の設定一式。
@@ -314,7 +357,10 @@ impl PtyInstance {
         let mut cmd = CommandBuilder::new(program);
         cmd.args(args);
         cmd.env("TERM", "xterm-256color");
-        let _child = pair.slave.spawn_command(cmd)?;
+        let child = pair.slave.spawn_command(cmd)?;
+        // kill 用ハンドルは PtyInstance が持ち、child 本体は読み取りスレッドへ渡して
+        // スレッド終了時に reap させる。
+        let killer = child.clone_killer();
 
         let writer_raw = pair.master.take_writer()?;
         let reader = pair.master.try_clone_reader()?;
@@ -325,6 +371,8 @@ impl PtyInstance {
         let ssh_info = format!("{program} {}", args.join(" "));
 
         std::thread::spawn(move || {
+            // どの return 経路でも子プロセスを reap する。
+            let _reaper = ChildReaper(child);
             let start = std::time::Instant::now();
             let mut raw_buf = [0u8; 4096];
             let mut reader = reader;
@@ -496,6 +544,7 @@ impl PtyInstance {
         Ok(Self {
             writer,
             master: Arc::new(Mutex::new(master)),
+            killer: std::sync::Mutex::new(killer),
         })
     }
 

@@ -72,6 +72,10 @@ pub struct LedgerEntry {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Ledger {
+    /// 台帳の対象ホスト alias。ファイル名は `sanitize_alias` 済みで元に戻せないため、
+    /// 横断一覧でホストを列挙できるよう中に保持する。旧形式（欠落）はファイル名で代替する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    alias: Option<String>,
     entries: Vec<LedgerEntry>,
 }
 
@@ -119,8 +123,54 @@ fn save_ledger(host_alias: &str, ledger: &Ledger) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("台帳ディレクトリ作成失敗: {e}"))?;
     }
-    let json = serde_json::to_string_pretty(ledger).map_err(|e| e.to_string())?;
+    // alias は常に現在のホスト名で書き直す（旧形式のファイルもこれで補完される）。
+    let to_write = Ledger {
+        alias: Some(host_alias.to_string()),
+        entries: ledger.entries.clone(),
+    };
+    let json = serde_json::to_string_pretty(&to_write).map_err(|e| e.to_string())?;
     std::fs::write(&path, json).map_err(|e| format!("台帳書き込み失敗: {e}"))
+}
+
+/// 台帳ファイルを持つホスト alias を列挙する。
+///
+/// インスタンスが 1 つも起動していないホストの forward を見つけるための入口。
+/// `alias` フィールドが無い旧形式の台帳はファイル名（sanitize 済み）で代替する。
+pub fn ledger_hosts() -> Vec<String> {
+    let Ok(dir) = crate::paths::forwards_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut hosts = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(ledger) = serde_json::from_str::<Ledger>(&content) else {
+            continue;
+        };
+        // 空の台帳はホストとして数えない（削除後の残骸）
+        if ledger.entries.is_empty() {
+            continue;
+        }
+        let alias = ledger.alias.clone().or_else(|| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+        });
+        if let Some(a) = alias {
+            hosts.push(a);
+        }
+    }
+    hosts.sort();
+    hosts.dedup();
+    hosts
 }
 
 // ─── mux コマンド ─────────────────────────────────────────────────────────────
@@ -389,6 +439,139 @@ pub fn list(host_alias: &str, hook_port: Option<u16>) -> Result<Vec<ForwardRow>,
     Ok(rows)
 }
 
+// ─── ホスト横断の一覧 ─────────────────────────────────────────────────────────
+
+/// forward 1 本の実効状態。ホスト単位の `stale` に「listen ポートが実際に
+/// 塞がっているか」を掛け合わせたもの。
+///
+/// 横断ビューでは「効いていない」だけでは足りず、**誰かに取られているのか
+/// 単に空いているのか**が分からないとポート衝突を解決できない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForwardState {
+    /// 現 master に適用されている（実際に転送が効いている）
+    Active,
+    /// 未適用で、listen ポートは別の何かが専有している
+    Blocked,
+    /// 未適用で、listen ポートは空いている（再適用すれば通る）
+    Inactive,
+}
+
+/// 横断一覧の 1 行。`ForwardRow` にホストと衝突情報を足したもの。
+#[derive(Debug, Clone, Serialize)]
+pub struct GlobalForwardRow {
+    pub host_alias: String,
+    pub spec: ForwardSpec,
+    /// "ledger" / "config" / "reserved"
+    pub origin: String,
+    pub reverse: bool,
+    pub state: ForwardState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub deletable: bool,
+    /// 同じ listen ポートを別のホストも登録している
+    pub conflict: bool,
+}
+
+/// `stale`（master 世代不一致）と listen ポートの空き状況から実効状態を決める。
+fn classify_state(stale: bool, port_free: bool) -> ForwardState {
+    if !stale {
+        ForwardState::Active
+    } else if port_free {
+        ForwardState::Inactive
+    } else {
+        ForwardState::Blocked
+    }
+}
+
+/// 同じ listen ポートを 2 つ以上のホストが登録している行に `conflict` を立てる。
+///
+/// bind アドレス（`listen_host`）は判定に含めない。`0.0.0.0:8080` と
+/// `127.0.0.1:8080` は実際には衝突するうえ、`None` / `localhost` / `127.0.0.1`
+/// が同じものを指すため、ポート番号だけで判定した方が実態に合う。
+///
+/// 同一ホスト内の重複は台帳のキー制約（`listen_key`）で起きないため、
+/// ホストを跨ぐ場合のみ衝突とみなす。`reserved`（ccc の hook 用予約）は
+/// ホストに紐づかないので判定から除く。
+fn mark_conflicts(rows: &mut [GlobalForwardRow]) {
+    use std::collections::{HashMap, HashSet};
+    let mut hosts_by_port: HashMap<u16, HashSet<&str>> = HashMap::new();
+    for r in rows.iter().filter(|r| r.origin != "reserved") {
+        hosts_by_port
+            .entry(r.spec.listen_port)
+            .or_default()
+            .insert(r.host_alias.as_str());
+    }
+    let conflicting: HashSet<u16> = hosts_by_port
+        .into_iter()
+        .filter(|(_, hosts)| hosts.len() > 1)
+        .map(|(port, _)| port)
+        .collect();
+    for r in rows.iter_mut() {
+        r.conflict = r.origin != "reserved" && conflicting.contains(&r.spec.listen_port);
+    }
+}
+
+/// 複数ホストの forward を 1 つの一覧に合成する。
+///
+/// 各ホストについて `sync_ledger`（世代チェック＋リプレイ）を行ってから
+/// `list` を呼ぶ。hook 用の reverse forward はホストに依存しないので、
+/// ホストごとに重複させず最後に 1 行だけ足す。
+///
+/// 並び順は listen ポート昇順 → ホスト名。衝突している行が隣り合うので
+/// UI 側でグルーピングしやすい。
+pub fn list_all(hosts: &[String], hook_port: Option<u16>) -> Vec<GlobalForwardRow> {
+    let mut rows: Vec<GlobalForwardRow> = Vec::new();
+
+    for host in hosts {
+        sync_ledger(host);
+        // hook 予約はここでは足さない（下でまとめて 1 行）
+        let Ok(host_rows) = list(host, None) else {
+            continue;
+        };
+        for r in host_rows {
+            let port_free = local_port_is_free(r.spec.listen_port);
+            rows.push(GlobalForwardRow {
+                host_alias: host.clone(),
+                state: classify_state(r.stale, port_free),
+                spec: r.spec,
+                origin: r.origin,
+                reverse: r.reverse,
+                error: r.error,
+                deletable: r.deletable,
+                conflict: false,
+            });
+        }
+    }
+
+    if let Some(port) = hook_port {
+        rows.push(GlobalForwardRow {
+            host_alias: String::new(),
+            spec: ForwardSpec {
+                listen_host: Some("127.0.0.1".into()),
+                listen_port: port,
+                dest_host: "127.0.0.1".into(),
+                dest_port: port,
+            },
+            origin: "reserved".into(),
+            reverse: true,
+            state: ForwardState::Active,
+            error: None,
+            deletable: false,
+            conflict: false,
+        });
+    }
+
+    mark_conflicts(&mut rows);
+    rows.sort_by(|a, b| {
+        a.spec
+            .listen_port
+            .cmp(&b.spec.listen_port)
+            .then_with(|| a.host_alias.cmp(&b.host_alias))
+    });
+    rows
+}
+
 /// `ssh -G` の `localforward` 行をパースする。
 /// 出力例: `localforward 3000 [localhost]:3000` / `localforward [127.0.0.1]:8080 [db]:5432`
 fn config_local_forwards(host_alias: &str) -> Result<Vec<ForwardSpec>, String> {
@@ -508,5 +691,90 @@ mod tests {
     fn sanitize_alias_replaces_path_separators() {
         assert_eq!(sanitize_alias("host/with\\sep"), "host_with_sep");
         assert_eq!(sanitize_alias("container-dev-host"), "container-dev-host");
+    }
+
+    // ─── 横断一覧 ────────────────────────────────────────────────────────────
+
+    fn row(host: &str, port: u16, origin: &str) -> GlobalForwardRow {
+        GlobalForwardRow {
+            host_alias: host.into(),
+            spec: ForwardSpec {
+                listen_host: None,
+                listen_port: port,
+                dest_host: "localhost".into(),
+                dest_port: port,
+            },
+            origin: origin.into(),
+            reverse: origin == "reserved",
+            state: ForwardState::Active,
+            error: None,
+            deletable: origin == "ledger",
+            conflict: false,
+        }
+    }
+
+    #[test]
+    fn classify_state_covers_three_cases() {
+        assert_eq!(classify_state(false, false), ForwardState::Active);
+        assert_eq!(classify_state(false, true), ForwardState::Active);
+        assert_eq!(classify_state(true, true), ForwardState::Inactive);
+        assert_eq!(classify_state(true, false), ForwardState::Blocked);
+    }
+
+    #[test]
+    fn conflicts_are_detected_across_hosts() {
+        // 実際に観測されたケース: 同じ listen ポートを 2 ホストが登録している
+        let mut rows = vec![
+            row("host-a", 8766, "ledger"),
+            row("host-b", 8766, "ledger"),
+            row("host-a", 8080, "ledger"),
+        ];
+        mark_conflicts(&mut rows);
+        assert!(rows[0].conflict);
+        assert!(rows[1].conflict);
+        assert!(!rows[2].conflict, "単独登録が衝突扱いになっている");
+    }
+
+    #[test]
+    fn same_host_same_port_is_not_a_conflict() {
+        // 台帳側は listen キーで一意なので、config 由来と重なっても同一ホスト内。
+        // ホスト内の重複は衝突として煽らない。
+        let mut rows = vec![row("host-a", 8080, "ledger"), row("host-a", 8080, "config")];
+        mark_conflicts(&mut rows);
+        assert!(!rows[0].conflict);
+        assert!(!rows[1].conflict);
+    }
+
+    #[test]
+    fn bind_address_does_not_split_conflict_detection() {
+        // 0.0.0.0:8080 と 127.0.0.1:8080 は実際には衝突する
+        let mut rows = vec![row("host-a", 8080, "ledger"), row("host-b", 8080, "ledger")];
+        rows[0].spec.listen_host = Some("0.0.0.0".into());
+        rows[1].spec.listen_host = Some("127.0.0.1".into());
+        mark_conflicts(&mut rows);
+        assert!(rows[0].conflict);
+        assert!(rows[1].conflict);
+    }
+
+    #[test]
+    fn reserved_row_is_excluded_from_conflicts() {
+        // hook 用予約はホストに紐づかないので、同じポートがあっても衝突にしない
+        let mut rows = vec![row("", 51397, "reserved"), row("host-a", 51397, "ledger")];
+        mark_conflicts(&mut rows);
+        assert!(!rows[0].conflict);
+        assert!(
+            !rows[1].conflict,
+            "reserved を除くと host-a は単独なので衝突ではない"
+        );
+    }
+
+    #[test]
+    fn ledger_roundtrips_alias() {
+        let json = r#"{"alias":"my-host","entries":[]}"#;
+        let l: Ledger = serde_json::from_str(json).unwrap();
+        assert_eq!(l.alias.as_deref(), Some("my-host"));
+        // 旧形式（alias 無し）も読める
+        let l: Ledger = serde_json::from_str(r#"{"entries":[]}"#).unwrap();
+        assert_eq!(l.alias, None);
     }
 }

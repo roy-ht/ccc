@@ -243,6 +243,7 @@ pub fn run() {
             explorer::explorer_copy_into,
             explorer::explorer_download,
             forwards::forwards_list,
+            forwards::forwards_list_all,
             forwards::forwards_add,
             forwards::forwards_remove,
             agent_socket::get_gpg_forward_status,

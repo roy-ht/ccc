@@ -1,4 +1,6 @@
 pub mod agent_config;
+pub mod auth_sync;
+pub mod claude_json;
 pub mod consts;
 pub(crate) mod debug_log;
 pub mod hook_dispatch;

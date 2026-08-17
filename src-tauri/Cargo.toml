@@ -10,7 +10,7 @@ sha2 = "0.10"
 
 [package]
 name = "ccc"
-version = "0.10.3"
+version = "0.11.1"
 description = "Claude Code Conductor"
 authors = ["Hiroyuki Tanaka"]
 edition = "2021"
@@ -28,6 +28,7 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 portable-pty = "0.8"
 uuid = { version = "1", features = ["v4"] }

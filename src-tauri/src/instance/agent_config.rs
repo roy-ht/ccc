@@ -44,17 +44,22 @@ pub fn local_claude_config_dir(profile: &str) -> anyhow::Result<PathBuf> {
 ///   (rsync `--safe-links`)
 /// - 絶対 symlink / 外部参照 / broken → 警告して除外
 ///
-/// `.credentials.json`:
+/// 資格情報ファイル:
 /// - rsync では `--exclude=.credentials.json` で常に除外する
 /// - sidecar `ccc-claude-auth` 経由で macOS Keychain から取得し、
-///   `~/.ccc/agent_settings/claude/<profile>/.credentials.json` として scp で送信
+///   リモートの値と比較した上で**必要なときだけ** scp で送信する
+///   (判定ロジックは [`super::auth_sync`]、転送は [`sync_remote_auth`])
 /// - Keychain にエントリがない場合は警告ログのみで起動を継続する
 ///   (リモート側で `claude /login` する想定)
+///
+/// `live_sibling` は「同じホスト × 同じプロファイルで既に生きている ccc インスタンス
+/// があるか」。リモートの状態を確認できなかったときの判定を安全側に倒すために使う。
 ///
 /// 戻り値: リモート側の絶対パス文字列 (`~/.ccc/agent_settings/claude/<profile>`)。
 pub fn prepare_remote_claude_config(
     host_alias: &str,
     profile: &str,
+    live_sibling: bool,
     log_path: Option<&Path>,
 ) -> anyhow::Result<String> {
     use super::debug_log;
@@ -176,6 +181,10 @@ pub fn prepare_remote_claude_config(
             "-az",
             "--safe-links",
             "--exclude=.credentials.json",
+            // `.claude.json` は projects (絶対パスをキーとする trust 承諾 /
+            // 許可済みツール / 入力履歴) を含むため丸ごと上書きすると
+            // リモートの状態を壊す。sync_remote_claude_json で選択的にマージする。
+            "--exclude=.claude.json",
             "--exclude=plugins/",
             "--exclude=projects/",
             "--exclude=cache/",
@@ -240,9 +249,24 @@ pub fn prepare_remote_claude_config(
         }
     }
 
-    // rsync 完了後にリモート側のプラグイン状態を CLI で再構築する。
-    // 失敗しても Claude Code 起動は継続できるよう、エラーは警告ログのみ。
     let remote_profile_dir = format!("{remote_home}/.ccc/agent_settings/claude/{profile}");
+
+    // `.claude.json` の選択的マージ。プラグイン復元より先に行う:
+    // - `claude plugin ...` は `.claude.json` を書き換えるため、後にマージすると
+    //   その結果を古い読み取り結果で巻き戻してしまう
+    // - `hasCompletedOnboarding` を先に置くことで、非対話の `claude plugin`
+    //   実行がオンボーディングで止まるのを防げる
+    sync_remote_claude_json(
+        host_alias,
+        profile,
+        &remote_profile_dir,
+        &local_profile_dir,
+        live_sibling,
+        log_path,
+    );
+
+    // リモート側のプラグイン状態を CLI で再構築する。
+    // 失敗しても Claude Code 起動は継続できるよう、エラーは警告ログのみ。
     restore_remote_plugins(
         host_alias,
         &remote_profile_dir,
@@ -250,71 +274,14 @@ pub fn prepare_remote_claude_config(
         log_path,
     );
 
-    // Keychain → 一時ファイル → scp で `.credentials.json` を送信
-    match fetch_credentials_via_sidecar(&local_profile_dir) {
-        Ok(creds) => {
-            let tmp_path = std::env::temp_dir()
-                .join(format!("ccc-cred-{}-{profile}.json", std::process::id()));
-            if let Err(e) = std::fs::write(&tmp_path, &creds) {
-                eprintln!("[ccc] credentials の一時書き出し失敗: {e}");
-                debug_log::append(
-                    log_path,
-                    &format!("[prepare_config] credentials 一時書き出し失敗: {e}"),
-                );
-            } else {
-                let t = std::time::Instant::now();
-                let target =
-                    format!("{host_alias}:.ccc/agent_settings/claude/{profile}/.credentials.json");
-                debug_log::append(
-                    log_path,
-                    &format!("[prepare_config] scp .credentials.json 開始: → {target}"),
-                );
-                let scp_result = Command::new("scp")
-                    .args(["-q", "-p"])
-                    .arg(&tmp_path)
-                    .arg(&target)
-                    .status();
-                let _ = std::fs::remove_file(&tmp_path);
-                let elapsed = t.elapsed().as_millis();
-                match scp_result {
-                    Ok(s) if s.success() => {
-                        debug_log::append(
-                            log_path,
-                            &format!("[prepare_config] scp .credentials.json 完了 (+{elapsed}ms)"),
-                        );
-                    }
-                    Ok(s) => {
-                        debug_log::append(
-                            log_path,
-                            &format!(
-                                "[prepare_config] scp .credentials.json 失敗 (+{elapsed}ms, status={s})"
-                            ),
-                        );
-                        eprintln!("[ccc] .credentials.json の scp が失敗: {s}");
-                    }
-                    Err(e) => {
-                        debug_log::append(
-                            log_path,
-                            &format!(
-                                "[prepare_config] scp .credentials.json エラー (+{elapsed}ms): {e}"
-                            ),
-                        );
-                        eprintln!("[ccc] scp 起動失敗: {e}");
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            debug_log::append(
-                log_path,
-                &format!("[prepare_config] Keychain credentials 取得失敗: {e}"),
-            );
-            eprintln!(
-                "[ccc] Keychain から credentials を取得できませんでした (profile={profile}): {e} \
-                 — リモートで `claude /login` を実行してください。"
-            );
-        }
-    }
+    sync_remote_auth(
+        host_alias,
+        profile,
+        &remote_profile_dir,
+        &local_profile_dir,
+        live_sibling,
+        log_path,
+    );
 
     debug_log::append(
         log_path,
@@ -325,6 +292,418 @@ pub fn prepare_remote_claude_config(
     );
     // tmux の `-e CLAUDE_CONFIG_DIR=...` でそのまま渡されるため、絶対パスを返す。
     Ok(remote_profile_dir)
+}
+
+/// 資格情報ファイルをリモートへ同期する。
+///
+/// ローカル (Keychain) とリモートのメタ情報を比較し、**リモートを古い資格情報で
+/// 上書きしない**ことを保証した上で、必要なときだけ転送する。判定は
+/// [`super::auth_sync::decide`] を参照。
+///
+/// 転送は「一時ファイルへ scp → リモートで `chmod 600` → `mv -f`」の 3 段で行う。
+/// `.credentials.json` へ直接 scp すると、リモートで走行中の Claude が
+/// 切り詰められた JSON を読む窓が生まれるため。`mv` は同一ファイルシステム上の
+/// rename なので原子的。
+///
+/// 失敗は全て警告ログのみ。Claude Code の起動自体は止めない
+/// (最悪リモートで `claude /login` すれば復旧できる)。
+fn sync_remote_auth(
+    host_alias: &str,
+    profile: &str,
+    remote_profile_dir: &str,
+    local_profile_dir: &Path,
+    live_sibling: bool,
+    log_path: Option<&Path>,
+) {
+    use super::auth_sync;
+    use super::debug_log;
+
+    let local_bytes = match fetch_local_auth_via_sidecar(local_profile_dir) {
+        Ok(b) => b,
+        Err(e) => {
+            debug_log::append(
+                log_path,
+                &format!("[auth_sync] Keychain からの取得に失敗: {e}"),
+            );
+            eprintln!(
+                "[ccc] Keychain から資格情報を取得できませんでした (profile={profile}): {e} \
+                 — リモートで `claude /login` を実行してください。"
+            );
+            return;
+        }
+    };
+
+    let local_meta = match auth_sync::parse(&local_bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            debug_log::append(
+                log_path,
+                &format!("[auth_sync] ローカル資格情報を解析できないため転送しない: {e}"),
+            );
+            eprintln!("[ccc] ローカル資格情報を解析できませんでした: {e}");
+            return;
+        }
+    };
+
+    let remote_state = match read_remote_file(
+        host_alias,
+        &format!("{remote_profile_dir}/.credentials.json"),
+        "auth_sync",
+        log_path,
+    ) {
+        RemoteFile::Missing => auth_sync::RemoteState::Missing,
+        RemoteFile::Unknown => auth_sync::RemoteState::Unknown,
+        RemoteFile::Present(bytes) => match auth_sync::parse(&bytes) {
+            Ok(meta) => auth_sync::RemoteState::Present(meta),
+            Err(e) => {
+                debug_log::append(
+                    log_path,
+                    &format!("[auth_sync] リモート資格情報を解析できない: {e}"),
+                );
+                auth_sync::RemoteState::Unknown
+            }
+        },
+    };
+    debug_log::append(
+        log_path,
+        &format!(
+            "[auth_sync] local(expires_at={}, refresh_expires_at={:?}, fp={}) / remote={} / live_sibling={live_sibling}",
+            local_meta.expires_at,
+            local_meta.refresh_token_expires_at,
+            local_meta.refresh_fp,
+            describe_remote_state(&remote_state),
+        ),
+    );
+
+    let verdict = auth_sync::decide(
+        &local_meta,
+        &remote_state,
+        live_sibling,
+        auth_sync::now_ms(),
+    );
+    debug_log::append(
+        log_path,
+        &format!(
+            "[auth_sync] 判定: {} — {}",
+            if verdict.send {
+                "転送する"
+            } else {
+                "転送しない"
+            },
+            verdict.reason
+        ),
+    );
+    if verdict.warn_user {
+        eprintln!("[ccc] {}", verdict.reason);
+    }
+    if !verdict.send {
+        return;
+    }
+
+    if let Err(e) = push_remote_file_atomically(
+        host_alias,
+        profile,
+        remote_profile_dir,
+        ".credentials.json",
+        &local_bytes,
+        "auth_sync",
+        log_path,
+    ) {
+        debug_log::append(log_path, &format!("[auth_sync] 転送に失敗: {e}"));
+        eprintln!("[ccc] 資格情報の転送に失敗: {e}");
+    }
+}
+
+/// `.claude.json` をリモートへ選択的にマージする。
+///
+/// rsync では `--exclude=.claude.json` で除外し、代わりにこの関数が
+/// [`super::claude_json::SYNCED_KEYS`] のトップレベルキーだけをローカル値で
+/// 上書きする。リモートの `projects`（絶対パスをキーとする trust 承諾 /
+/// 許可済みツール / 入力履歴）は完全に保持される。
+///
+/// 走行中の Claude はこのファイルを読み書きするため、`live_sibling` のときは
+/// 一切触らない。必要なキーは前回接続時に入っている。
+///
+/// 失敗は全て警告ログのみで、Claude Code の起動は止めない。
+fn sync_remote_claude_json(
+    host_alias: &str,
+    profile: &str,
+    remote_profile_dir: &str,
+    local_profile_dir: &Path,
+    live_sibling: bool,
+    log_path: Option<&Path>,
+) {
+    use super::claude_json;
+    use super::debug_log;
+
+    if live_sibling {
+        debug_log::append(
+            log_path,
+            "[claude_json] 同一ホスト・プロファイルで稼働中のインスタンスがあるためスキップ",
+        );
+        return;
+    }
+
+    let local_path = local_profile_dir.join(".claude.json");
+    let local_raw = match std::fs::read(&local_path) {
+        Ok(b) => b,
+        Err(e) => {
+            debug_log::append(
+                log_path,
+                &format!("[claude_json] ローカルに .claude.json が無いためスキップ: {e}"),
+            );
+            return;
+        }
+    };
+    let local_value: serde_json::Value = match serde_json::from_slice(&local_raw) {
+        Ok(v) => v,
+        Err(e) => {
+            debug_log::append(
+                log_path,
+                &format!("[claude_json] ローカル .claude.json を解析できないためスキップ: {e}"),
+            );
+            return;
+        }
+    };
+
+    // リモート側の現在値。読めない場合は状態を壊しうるので触らない。
+    let remote_value = match read_remote_file(
+        host_alias,
+        &format!("{remote_profile_dir}/.claude.json"),
+        "claude_json",
+        log_path,
+    ) {
+        RemoteFile::Missing => serde_json::Value::Null,
+        RemoteFile::Present(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                debug_log::append(
+                    log_path,
+                    &format!("[claude_json] リモート .claude.json を解析できないためスキップ: {e}"),
+                );
+                return;
+            }
+        },
+        RemoteFile::Unknown => {
+            debug_log::append(
+                log_path,
+                "[claude_json] リモートの状態を確認できないためスキップ",
+            );
+            return;
+        }
+    };
+
+    let Some(result) = claude_json::merge(&local_value, &remote_value) else {
+        debug_log::append(log_path, "[claude_json] 差分なし — 書き込みをスキップ");
+        return;
+    };
+    debug_log::append(
+        log_path,
+        &format!("[claude_json] 更新するキー: {:?}", result.updated_keys),
+    );
+
+    let bytes = match serde_json::to_vec_pretty(&result.merged) {
+        Ok(b) => b,
+        Err(e) => {
+            debug_log::append(log_path, &format!("[claude_json] JSON 生成に失敗: {e}"));
+            return;
+        }
+    };
+    if let Err(e) = push_remote_file_atomically(
+        host_alias,
+        profile,
+        remote_profile_dir,
+        ".claude.json",
+        &bytes,
+        "claude_json",
+        log_path,
+    ) {
+        debug_log::append(log_path, &format!("[claude_json] 転送に失敗: {e}"));
+        eprintln!("[ccc] .claude.json の同期に失敗: {e}");
+    }
+}
+
+/// リモートファイルの読み取り結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteFile {
+    /// ファイルが存在しない。
+    Missing,
+    /// 読み取れた（中身は秘密を含みうるのでログに出さない）。
+    Present(Vec<u8>),
+    /// ssh 失敗・権限エラーなど、状態を判定できなかった。
+    Unknown,
+}
+
+/// リモートのファイルを読み、3 状態に分類する。
+///
+/// 終了コードで区別する:
+/// - 0 + stdout あり → `Present`
+/// - 3 → ファイルが存在しない (`Missing`)
+/// - その他 (ssh 失敗、権限エラー、0 バイトファイル等) → `Unknown`
+///
+/// stdout には資格情報や入力履歴が載りうるため、**内容は一切ログに出さない**。
+fn read_remote_file(
+    host_alias: &str,
+    remote_path: &str,
+    tag: &str,
+    log_path: Option<&Path>,
+) -> RemoteFile {
+    use super::debug_log;
+
+    let script = format!(
+        "if [ -f {p} ]; then cat {p}; else exit 3; fi",
+        p = sh_quote(remote_path)
+    );
+    let t = std::time::Instant::now();
+    let out = match Command::new("ssh")
+        .args(["-T", host_alias])
+        .arg(&script)
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            debug_log::append(log_path, &format!("[{tag}] ssh 起動失敗: {e}"));
+            return RemoteFile::Unknown;
+        }
+    };
+    let elapsed = t.elapsed().as_millis();
+
+    match out.status.code() {
+        Some(0) if !out.stdout.is_empty() => {
+            debug_log::append(
+                log_path,
+                &format!(
+                    "[{tag}] リモートファイルを取得 (+{elapsed}ms, {} bytes)",
+                    out.stdout.len()
+                ),
+            );
+            RemoteFile::Present(out.stdout)
+        }
+        Some(3) => {
+            debug_log::append(
+                log_path,
+                &format!("[{tag}] リモートにファイルなし (+{elapsed}ms)"),
+            );
+            RemoteFile::Missing
+        }
+        code => {
+            debug_log::append(
+                log_path,
+                &format!("[{tag}] リモートファイルの確認に失敗 (+{elapsed}ms, status={code:?})"),
+            );
+            RemoteFile::Unknown
+        }
+    }
+}
+
+/// 一時ファイル経由で原子的にリモートへ配置する。
+///
+/// ローカル一時ファイルは 0600 で作成し、成功・失敗いずれの経路でも削除する。
+/// リモートでも `chmod 600` してから `mv -f` する。`mv` は同一ファイルシステム上の
+/// rename なので原子的で、走行中の Claude が中途半端なファイルを読むことがない。
+fn push_remote_file_atomically(
+    host_alias: &str,
+    profile: &str,
+    remote_profile_dir: &str,
+    file_name: &str,
+    bytes: &[u8],
+    tag: &str,
+    log_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    use super::debug_log;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let pid = std::process::id();
+    let local_tmp = std::env::temp_dir().join(format!("ccc-{tag}-{pid}-{profile}.json"));
+    // 直前のクラッシュ等で残っていた場合、`mode()` は既存ファイルに適用されないので
+    // 必ず消してから作り直す。
+    let _ = std::fs::remove_file(&local_tmp);
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&local_tmp)
+            .map_err(|e| anyhow::anyhow!("一時ファイルの作成に失敗: {e}"))?;
+        f.write_all(bytes)
+            .map_err(|e| anyhow::anyhow!("一時ファイルの書き出しに失敗: {e}"))?;
+    }
+
+    // scp のリモートパスは既存実装と同じくホーム相対で指定する。
+    // OpenSSH 9 以降は SFTP モードが既定でリモートシェル展開が効かないため、
+    // クォートを付けずホーム相対のまま渡すのが最も互換性が高い。
+    let remote_tmp_rel = format!(".ccc/agent_settings/claude/{profile}/{file_name}.ccc-tmp");
+    let target = format!("{host_alias}:{remote_tmp_rel}");
+    let t = std::time::Instant::now();
+    let scp_status = Command::new("scp")
+        .args(["-q", "-p"])
+        .arg(&local_tmp)
+        .arg(&target)
+        .status();
+    let _ = std::fs::remove_file(&local_tmp);
+    let elapsed = t.elapsed().as_millis();
+
+    match scp_status {
+        Ok(s) if s.success() => debug_log::append(
+            log_path,
+            &format!("[{tag}] scp 完了 (+{elapsed}ms) → {remote_tmp_rel}"),
+        ),
+        Ok(s) => anyhow::bail!("scp が失敗 (+{elapsed}ms, status={s})"),
+        Err(e) => anyhow::bail!("scp の起動に失敗 (+{elapsed}ms): {e}"),
+    }
+
+    // chmod → mv を 1 回の ssh でまとめて実行する。
+    let remote_tmp_abs = format!("{remote_profile_dir}/{file_name}.ccc-tmp");
+    let remote_final = format!("{remote_profile_dir}/{file_name}");
+    let script = format!(
+        "chmod 600 {tmp} && mv -f {tmp} {dst}",
+        tmp = sh_quote(&remote_tmp_abs),
+        dst = sh_quote(&remote_final)
+    );
+    let t = std::time::Instant::now();
+    let out = Command::new("ssh")
+        .args(["-T", host_alias])
+        .arg(&script)
+        .output()
+        .map_err(|e| anyhow::anyhow!("ssh の起動に失敗: {e}"))?;
+    let elapsed = t.elapsed().as_millis();
+    if !out.status.success() {
+        // 中途半端な一時ファイルを残さない
+        let cleanup = format!("rm -f {}", sh_quote(&remote_tmp_abs));
+        let _ = Command::new("ssh")
+            .args(["-T", host_alias])
+            .arg(&cleanup)
+            .status();
+        anyhow::bail!(
+            "リモートでの配置に失敗 (+{elapsed}ms, status={}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    debug_log::append(
+        log_path,
+        &format!("[{tag}] リモートへ原子的に配置完了 (+{elapsed}ms) → {remote_final}"),
+    );
+    Ok(())
+}
+
+/// ログ用にリモート状態を秘密なしで 1 行表現する。
+fn describe_remote_state(state: &super::auth_sync::RemoteState) -> String {
+    use super::auth_sync::RemoteState;
+    match state {
+        RemoteState::Missing => "missing".to_string(),
+        RemoteState::Unknown => "unknown".to_string(),
+        RemoteState::Present(m) => format!(
+            "present(expires_at={}, refresh_expires_at={:?}, fp={})",
+            m.expires_at, m.refresh_token_expires_at, m.refresh_fp
+        ),
+    }
+}
+
+/// POSIX sh の single quote で安全に囲む。`'` は `'\''` へ展開する。
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// ローカルのプラグイン設定 (`plugins/known_marketplaces.json`,
@@ -639,7 +1018,10 @@ fn walk(path: &Path, callback: &mut dyn FnMut(&Path)) {
     }
 }
 
-fn fetch_credentials_via_sidecar(config_dir: &Path) -> anyhow::Result<Vec<u8>> {
+/// sidecar `ccc-claude-auth` 経由で macOS Keychain から資格情報を取り出す。
+///
+/// 戻り値はファイルへそのまま書ける生バイト列。呼び出し側は内容をログに出さないこと。
+fn fetch_local_auth_via_sidecar(config_dir: &Path) -> anyhow::Result<Vec<u8>> {
     let bin = paths::ccc_claude_auth_bin()?;
     let output = Command::new(&bin)
         .arg("get-credentials")

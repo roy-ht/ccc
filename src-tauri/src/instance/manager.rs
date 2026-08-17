@@ -109,6 +109,10 @@ pub struct InstanceManager {
     /// インスタンスごとのシャドウスクリーン（v0.12 画面状態検出、非永続）。
     /// relay 起動時に生成され、評価タスクが定期巡回する。
     screen_monitors: Arc<DashMap<InstanceId, Arc<Mutex<ScreenMonitor>>>>,
+    /// インスタンスごとの relay 世代（非永続）。PTY を張り直すたびに加算する。
+    /// 旧 PTY の relay が遅れて終了したときに、現行接続の status を
+    /// Disconnected へ踏み潰すのを防ぐ（`relay::spawn_relay` の世代ガード）。
+    relay_epochs: Arc<DashMap<InstanceId, u64>>,
     /// 画面補正が設定した status の控え（hook 適用でクリア、非永続）。
     screen_set: Arc<DashMap<InstanceId, InstanceStatus>>,
     /// ホストごとの half-open/wedged 連続検知回数（v0.13、非永続）。
@@ -143,6 +147,7 @@ impl InstanceManager {
             last_hook_sent_at: Arc::new(DashMap::new()),
             watchdog_suspects: Arc::new(DashMap::new()),
             screen_monitors: Arc::new(DashMap::new()),
+            relay_epochs: Arc::new(DashMap::new()),
             screen_set: Arc::new(DashMap::new()),
             resilience_strikes: Arc::new(DashMap::new()),
             forward_status: Arc::new(DashMap::new()),
@@ -637,6 +642,11 @@ impl InstanceManager {
     /// 5箇所以上で同じ構築をしていたためヘルパー化。
     /// relay 1本につき 1 回呼ばれるため、シャドウスクリーンの生成・登録もここで行う
     /// （再接続時は新しいモニタで置き換え、古い画面状態を引きずらない）。
+    /// relay 用のコンテキストを組み立てる。
+    ///
+    /// 呼び出しごとに relay 世代を 1 つ進める。`spawn_relay` の直前に
+    /// 1 回だけ呼ぶ前提で、これにより「今から張る PTY が現行世代」になり、
+    /// 差し替えられた旧 PTY の relay は自動的に旧世代へ落ちる。
     fn relay_context(&self, id: InstanceId) -> RelayContext {
         let (rows, cols) = self
             .infos
@@ -646,11 +656,23 @@ impl InstanceManager {
         let monitor = Arc::new(Mutex::new(ScreenMonitor::new(rows, cols)));
         self.screen_monitors
             .insert(id.clone(), Arc::clone(&monitor));
+        let epoch = {
+            let mut e = self.relay_epochs.entry(id.clone()).or_insert(0);
+            *e += 1;
+            *e
+        };
+        let log_path = self
+            .infos
+            .get(&id)
+            .map(|i| i.instance_dir.join(".debug.txt"));
         RelayContext {
             instance_id: id,
             infos: Arc::clone(&self.infos),
             app_handle: self.app_handle.get().cloned(),
             monitor,
+            epoch,
+            epochs: Arc::clone(&self.relay_epochs),
+            log_path,
         }
     }
 
@@ -780,14 +802,29 @@ impl InstanceManager {
             "[create_remote] 開始: host={host_alias}, dir={dir_str:?}, profile={profile}, tmux={tmux_name}"
         ));
 
+        // 同じホスト × 同じプロファイルで既に生きているインスタンスがあるか。
+        // ある場合、リモートの Claude が資格情報を更新済みの可能性があるため、
+        // リモートの状態を確認できなかったときの判定を安全側 (転送しない) に倒す。
+        // Terminated 以外は tmux セッションが残って claude が動いている可能性がある
+        // ので「生きている」とみなす。
+        let live_sibling = self.infos.iter().any(|e| {
+            let i = e.value();
+            i.host_alias.as_deref() == Some(host_alias)
+                && i.agent_profile == profile
+                && i.status != InstanceStatus::Terminated
+        });
+
         let t = std::time::Instant::now();
         debug_log::append(
             log_path.as_deref(),
-            "[create_remote] prepare_remote_claude_config 開始",
+            &format!(
+                "[create_remote] prepare_remote_claude_config 開始 (live_sibling={live_sibling})"
+            ),
         );
         let remote_cfg = match agent_config::prepare_remote_claude_config(
             host_alias,
             profile,
+            live_sibling,
             log_path.as_deref(),
         ) {
             Ok(c) => c,
@@ -1924,6 +1961,7 @@ impl InstanceManager {
         self.infos.remove(id);
         self.pending_scrollback.remove(id);
         self.screen_monitors.remove(id);
+        self.relay_epochs.remove(id);
         self.screen_set.remove(id);
         self.last_hook_at.remove(id);
         self.last_hook_sent_at.remove(id);

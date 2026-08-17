@@ -6,7 +6,6 @@ import { MainTabs } from "./components/MainTabs";
 import { SessionsPanel } from "./components/SessionsPanel";
 import { MemoriesPanel } from "./components/MemoriesPanel";
 import { ExplorerPanel } from "./components/explorer/ExplorerPanel";
-import { ForwardsPanel } from "./components/ForwardsPanel";
 import { NewInstanceDialog } from "./components/NewInstanceDialog";
 import { SettingsPage } from "./components/SettingsPage";
 import { ConfirmDialog } from "./components/ConfirmDialog";
@@ -257,10 +256,18 @@ function App() {
     [subscribeOutput]
   );
 
+  // 切断中の入力は PTY が無いので送っても届かないが、**黙って捨てない**。
+  // 無言の握り潰しは「キーが全く効かない」という原因不明の症状に化けるため、
+  // 必ず理由を提示して次の行動（再接続 / 再作成）へ誘導する。
   const handleData = useCallback(
     (instanceId: InstanceId, data: Uint8Array) => {
       const instance = instances.find((s) => s.id === instanceId);
       if (instance && (instance.status === "disconnected" || instance.status === "terminated")) {
+        setError(
+          instance.status === "disconnected"
+            ? "接続が切れているため入力を送れません。サイドバーの「再接続」を実行してください。"
+            : "このインスタンスは終了しています。サイドバーの「再作成」を実行してください。"
+        );
         return;
       }
       writeToInstance(instanceId, data).catch(() => {});
@@ -393,11 +400,7 @@ function App() {
       />
       <main className="main-panel">
         {activeInstance && (
-          <MainTabs
-            active={activeTab}
-            onChange={setActiveTab}
-            showForwards={activeInstance.kind === "remote" && !!activeInstance.host_alias}
-          />
+          <MainTabs active={activeTab} onChange={setActiveTab} />
         )}
         <div className="main-body">
           {instances.length === 0 && (
@@ -451,9 +454,6 @@ function App() {
           )}
           {activeInstance && activeTab === "explorer" && (
             <ExplorerPanel key={activeInstance.id} instance={activeInstance} />
-          )}
-          {activeInstance && activeTab === "forwards" && activeInstance.host_alias && (
-            <ForwardsPanel key={activeInstance.id} hostAlias={activeInstance.host_alias} />
           )}
         </div>
       </main>
