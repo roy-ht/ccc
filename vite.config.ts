@@ -18,6 +18,19 @@ export default defineConfig(async () => ({
     },
   },
 
+  // 依存プリバンドル (dev の optimizeDeps) は上の `esbuild` 設定を継承しない。
+  // alias で TS ソースを直接読む @xterm 系（デコレータ使用）が node_modules 配下に
+  // あるため、こちらでも experimentalDecorators を有効にしておく必要がある。
+  optimizeDeps: {
+    esbuildOptions: {
+      tsconfigRaw: {
+        compilerOptions: {
+          experimentalDecorators: true,
+        },
+      },
+    },
+  },
+
   // @xterm/addon-webgl 0.19.0 の公開 bundle には、長時間稼働後の texture atlas
   // merge で表示内容と選択位置が食い違う不具合がある。pnpm patch で取り込んだ
   // upstream 修正済み source を bundle 対象にする（正式リリース後は削除可能）。
