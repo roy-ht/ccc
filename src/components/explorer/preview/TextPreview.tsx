@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { formatBytes } from "../../../utils/filetype";
+import { formatJsonText, looksLikeJson, splitHighlightedLines } from "../../../utils/textPreview";
 
 interface Props {
   content: string;
@@ -9,74 +10,146 @@ interface Props {
   highlightLine?: number | null;
 }
 
+const WRAP_STORAGE_KEY = "ccc.explorer-preview-wrap";
+
+function loadWrapPref(): boolean {
+  try {
+    return localStorage.getItem(WRAP_STORAGE_KEY) === "1";
+  } catch {
+    // localStorage 不可なら折り返しなし
+    return false;
+  }
+}
+
+/** JSON 整形の結果。`source` は整形元の content（ファイル切替で無効化するため）。 */
+interface JsonView {
+  source: string;
+  text: string | null;
+  error: string | null;
+}
+
 /**
  * テキストファイルのプレビュー。highlight.js を必要な言語だけ動的 import して
  * 適用する。失敗時はプレーン表示にフォールバックする。`highlightLine` が指定
  * された場合、その行をハイライトし、ビュー内にスクロールする。
+ *
+ * ツールバーで以下を切り替えられる:
+ * - 折り返し: 長い行を折り返す（設定は localStorage に永続化）
+ * - JSON 整形: JSON / JSON Lines をインデント付きに整形して表示
  */
 export function TextPreview({ content, language, truncated, size, highlightLine }: Props) {
   const [highlighted, setHighlighted] = useState<string | null>(null);
-  const codeRef = useRef<HTMLElement>(null);
-  const lineRef = useRef<HTMLSpanElement>(null);
+  const [wrap, setWrap] = useState<boolean>(loadWrapPref);
+  const [jsonView, setJsonView] = useState<JsonView | null>(null);
+  const lineRef = useRef<HTMLDivElement>(null);
+
+  // ファイルが切り替わったら（content が変われば）整形状態は自動的に無効化する。
+  const activeJson = jsonView && jsonView.source === content ? jsonView : null;
+  const formatted = activeJson?.text ?? null;
+  const displayContent = formatted ?? content;
+  const jsonCapable = useMemo(() => looksLikeJson(language, content), [language, content]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(WRAP_STORAGE_KEY, wrap ? "1" : "0");
+    } catch {
+      // 保存失敗は無視
+    }
+  }, [wrap]);
 
   useEffect(() => {
     let cancelled = false;
     const lang = mapLanguage(language);
-    if (!lang) {
-      setHighlighted(null);
-      return;
-    }
-    applyHighlight(content, lang).then((html) => {
+    // 前のファイル / 整形前の結果が残ると行がズレるので、いったん捨てる。
+    setHighlighted(null);
+    if (!lang) return;
+    applyHighlight(displayContent, lang).then((html) => {
       if (!cancelled) setHighlighted(html);
     });
     return () => {
       cancelled = true;
     };
-  }, [content, language]);
+  }, [displayContent, language]);
 
   // highlightLine が指定されたら、ビューポートに収まるようスクロール。
   useEffect(() => {
     if (highlightLine && lineRef.current) {
       lineRef.current.scrollIntoView({ block: "center" });
     }
-  }, [highlightLine, highlighted]);
+  }, [highlightLine, highlighted, wrap]);
 
-  // 行ハイライトは行番号オーバーレイで表現する。
-  const lines = content.split("\n");
-  const focusIdx = highlightLine != null ? Math.max(0, highlightLine - 1) : -1;
+  const lines = useMemo(() => displayContent.split("\n"), [displayContent]);
+  // 行をまたぐ span を閉じ直して行単位に分割する。折り返し時も行番号と本文が
+  // 1 行ずつ対応するので、行の高さが伸びてもズレない。
+  const htmlLines = useMemo(
+    () => (highlighted ? splitHighlightedLines(highlighted) : null),
+    [highlighted],
+  );
+  // ハイライト計算は非同期なので、行数が合わない間はプレーン表示にフォールバック。
+  const renderedHtml = htmlLines && htmlLines.length === lines.length ? htmlLines : null;
+
+  // 整形表示中は元ファイルの行番号と対応しないため、行ハイライトは無効化する。
+  const focusIdx = highlightLine != null && !formatted ? Math.max(0, highlightLine - 1) : -1;
+
+  const toggleJson = () => {
+    if (activeJson) {
+      setJsonView(null);
+      return;
+    }
+    const result = formatJsonText(content);
+    setJsonView(
+      result.ok
+        ? { source: content, text: result.text, error: null }
+        : { source: content, text: null, error: result.error },
+    );
+  };
 
   return (
     <div className="text-preview">
+      <div className="text-preview-toolbar">
+        <button
+          className={`text-preview-btn ${wrap ? "active" : ""}`}
+          onClick={() => setWrap((v) => !v)}
+          title="長い行を折り返して表示する"
+        >
+          折り返し
+        </button>
+        {jsonCapable && (
+          <button
+            className={`text-preview-btn ${formatted ? "active" : ""}`}
+            onClick={toggleJson}
+            title="JSON / JSON Lines をインデント付きで整形して表示する"
+          >
+            JSON 整形
+          </button>
+        )}
+      </div>
       {truncated && (
         <div className="text-preview-banner">
           先頭 {formatBytes(content.length)} を表示中（全 {formatBytes(size)}）
         </div>
       )}
-      <div className="text-preview-body">
-        <div className="text-preview-gutter">
-          {lines.map((_, i) => (
-            <span
+      {activeJson?.error && <div className="text-preview-banner error">{activeJson.error}</div>}
+      <div className={`text-preview-body ${wrap ? "wrap" : ""}`}>
+        <div className="text-preview-lines">
+          {lines.map((line, i) => (
+            <div
               key={i}
               ref={i === focusIdx ? lineRef : undefined}
-              className={`text-preview-lineno ${i === focusIdx ? "focus" : ""}`}
+              className={`text-preview-row ${i === focusIdx ? "focus" : ""}`}
             >
-              {i + 1}
-            </span>
+              <span className="text-preview-lineno">{i + 1}</span>
+              {renderedHtml ? (
+                <span
+                  className="text-preview-code"
+                  dangerouslySetInnerHTML={{ __html: renderedHtml[i] }}
+                />
+              ) : (
+                <span className="text-preview-code">{line}</span>
+              )}
+            </div>
           ))}
         </div>
-        <pre className="text-preview-pre">
-          {highlighted ? (
-            <code
-              ref={codeRef}
-              className={`hljs language-${mapLanguage(language) ?? "plaintext"}`}
-              dangerouslySetInnerHTML={{ __html: highlighted }}
-            />
-          ) : (
-            <code ref={codeRef} className="text-preview-plain">
-              {content}
-            </code>
-          )}
-        </pre>
       </div>
     </div>
   );
@@ -101,6 +174,8 @@ function mapLanguage(ext?: string | null): string | null {
     case "py":
       return "python";
     case "json":
+    case "jsonl":
+    case "ndjson":
       return "json";
     case "yml":
     case "yaml":

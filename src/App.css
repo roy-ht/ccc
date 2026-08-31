@@ -2500,6 +2500,37 @@ html, body, #root {
   min-height: 0;
 }
 
+.text-preview-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-surface);
+  flex-shrink: 0;
+}
+
+.text-preview-btn {
+  appearance: none;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  padding: 3px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.text-preview-btn:hover {
+  color: var(--text-primary);
+}
+
+.text-preview-btn.active {
+  color: var(--text-primary);
+  background: var(--bg-active);
+  border-color: rgba(96, 165, 250, 0.35);
+}
+
 .text-preview-banner {
   padding: 4px 12px;
   background: rgba(251, 146, 60, 0.12);
@@ -2509,64 +2540,74 @@ html, body, #root {
   flex-shrink: 0;
 }
 
+.text-preview-banner.error {
+  background: rgba(248, 113, 113, 0.12);
+  color: var(--danger);
+}
+
 .text-preview-body {
   flex: 1;
-  display: flex;
   overflow: auto;
   min-height: 0;
   background: var(--bg-base);
-}
-
-.text-preview-gutter {
-  display: flex;
-  flex-direction: column;
-  padding: 10px 4px 10px 10px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px;
-  line-height: 1.5;
-  color: var(--text-muted);
-  background: var(--bg-surface);
-  border-right: 1px solid var(--border);
-  user-select: none;
-  flex-shrink: 0;
-  text-align: right;
-}
-
-.text-preview-lineno {
-  display: block;
-  min-width: 36px;
-}
-
-.text-preview-lineno.focus {
-  color: var(--accent);
-  background: rgba(96, 165, 250, 0.15);
-  border-radius: 3px;
-}
-
-.text-preview-pre {
-  margin: 0;
-  padding: 10px 12px;
-  flex: 1;
-  min-width: 0;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
   line-height: 1.5;
   color: var(--text-primary);
-  background: transparent;
-  white-space: pre;
-  overflow: visible;
 }
 
-.text-preview-pre code {
-  font-family: inherit;
-  font-size: inherit;
-  background: transparent;
-  padding: 0;
-  border: none;
+.text-preview-lines {
+  display: flex;
+  flex-direction: column;
+  /* 折り返しなしのときは最長行に合わせて広げ、focus 行の背景を全幅に届かせる */
+  min-width: max-content;
+  padding: 10px 0;
 }
 
-.text-preview-plain {
+.text-preview-body.wrap .text-preview-lines {
+  min-width: 0;
+}
+
+.text-preview-row {
+  display: flex;
+  align-items: flex-start;
+}
+
+.text-preview-row.focus {
+  background: rgba(96, 165, 250, 0.12);
+}
+
+.text-preview-lineno {
+  /* 横スクロールしても行番号は左端に残す */
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  flex-shrink: 0;
+  min-width: 50px;
+  padding: 0 8px 0 10px;
+  text-align: right;
+  color: var(--text-muted);
+  background: var(--bg-surface);
+  border-right: 1px solid var(--border);
+  user-select: none;
+}
+
+.text-preview-row.focus .text-preview-lineno {
+  color: var(--accent);
+  /* sticky で本文が下を通るため、不透明色の上に半透明の強調色を重ねる */
+  background-image: linear-gradient(rgba(96, 165, 250, 0.15), rgba(96, 165, 250, 0.15));
+}
+
+.text-preview-code {
+  flex: 1;
+  min-width: 0;
+  padding: 0 12px;
   white-space: pre;
+}
+
+.text-preview-body.wrap .text-preview-code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 /* ── Markdown preview ── */

@@ -76,8 +76,8 @@ ccc (Claude Code Conductor) は、Claude Code などのコーディングエー�
 
 - ローカル / リモート (SSH 経由) を同じ UI で扱う抽象化
 - ツリー左ペインは遅延ロード、展開状態は `localStorage` に永続化
-- プレビュー: Text (syntax highlight) / Markdown (source / preview トグル) /
-  画像 / PDF に対応
+- プレビュー: Text (syntax highlight / 行の折り返し切替 / JSON 整形) /
+  Markdown (source / preview トグル) / 画像 / PDF に対応
 - 全文検索は **ripgrep 呼び出し**、リモートは ControlMaster を再利用した
   `ssh -T <alias> 'rg ...'`
 - OS のファイルマネージャからのドラッグ & ドロップで、ローカル → ローカル
