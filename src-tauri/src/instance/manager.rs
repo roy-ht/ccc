@@ -122,6 +122,12 @@ pub struct InstanceManager {
     /// ホストごとの gpg agent forward 疎通状態（60 秒監視ループが更新、非永続）。
     /// UI がバッジ表示 / Tauri command `get_gpg_forward_status` で取得する。
     forward_status: Arc<DashMap<String, ccc_sshkit::agent_socket::ForwardHealth>>,
+    /// `restore()` が既に実行されたか（プロセス生存中 1 回きり）。
+    /// フロントの二重 invoke（webview リロード等）で復元が再実行されると、
+    /// 生きているインスタンスに対して PTY をもう一本張ってしまい、
+    /// 旧 PTY の破棄・出力チャンネルの差し替えを通じて画面が沈黙する。
+    /// 詳細は `restore()` のコメントを参照。
+    restore_done: std::sync::atomic::AtomicBool,
 }
 
 impl InstanceManager {
@@ -151,6 +157,7 @@ impl InstanceManager {
             screen_set: Arc::new(DashMap::new()),
             resilience_strikes: Arc::new(DashMap::new()),
             forward_status: Arc::new(DashMap::new()),
+            restore_done: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -638,11 +645,31 @@ impl InstanceManager {
         }
     }
 
+    /// インスタンスの出力 broadcast チャンネルを取得する。既にあれば**必ず再利用**し、
+    /// 無いときだけ新規作成する。
+    ///
+    /// 再利用が必須なのは、フロントの購読タスク（`subscribe`）が
+    /// `broadcast::Receiver` を握りっぱなしにするため。ここで `insert` して
+    /// チャンネルを差し替えると、旧 Sender を持っていた relay が終了した瞬間に
+    /// 旧 Receiver が `Closed` になり、購読タスクが停止して**画面が永久に沈黙する**。
+    /// しかも `write` は新しい PTY に届くので、入力だけが通って画面が
+    /// 更新されないという最も分かりにくい壊れ方をする（v0.12.0 で修正）。
+    ///
+    /// PTY を張り直しても「そのインスタンスの出力の宛先」は同一であるべきで、
+    /// チャンネルの寿命はインスタンスの寿命（`close` まで）と一致させる。
+    fn ensure_broadcast(&self, id: &str) -> OutputBroadcast {
+        if let Some(tx) = self.broadcasts.get(id) {
+            return tx.clone();
+        }
+        let (tx, _) = broadcast::channel::<Vec<u8>>(BROADCAST_CHANNEL_SIZE);
+        self.broadcasts.insert(id.to_string(), tx.clone());
+        tx
+    }
+
     /// `RelayContext` をインスタンスIDから組み立てる。
     /// 5箇所以上で同じ構築をしていたためヘルパー化。
     /// relay 1本につき 1 回呼ばれるため、シャドウスクリーンの生成・登録もここで行う
     /// （再接続時は新しいモニタで置き換え、古い画面状態を引きずらない）。
-    /// relay 用のコンテキストを組み立てる。
     ///
     /// 呼び出しごとに relay 世代を 1 つ進める。`spawn_relay` の直前に
     /// 1 回だけ呼ぶ前提で、これにより「今から張る PTY が現行世代」になり、
@@ -1172,7 +1199,21 @@ impl InstanceManager {
     }
 
     /// `~/.ccc/instances/` を走査し、保存済みインスタンスを tmux reattach で復元する。
+    ///
+    /// **プロセス生存中 1 回しか実行しない。** 復元はアプリ起動時の一度きりが前提で、
+    /// 2 回目以降は既に生きているインスタンスに対して PTY をもう一本張ってしまう。
+    /// 実際に webview のリロードでフロントが `restore_instances` を再 invoke し、
+    /// 二重に張られた ssh のうち旧世代が破棄された結果、フロントの購読が切れて
+    /// 「入力は通るが画面が更新されない」状態に陥る事故が起きた（v0.12.0）。
+    ///
+    /// 再入は無視して既存の一覧をそのまま使わせる。切断済みインスタンスの復旧は
+    /// `reconnect`（ユーザー操作 / watchdog）の責務であって restore ではない。
     pub async fn restore(&self) {
+        use std::sync::atomic::Ordering;
+        if self.restore_done.swap(true, Ordering::SeqCst) {
+            eprintln!("[ccc] restore() は実行済みのため再入をスキップします");
+            return;
+        }
         let dirs = match storage::list_instance_dirs() {
             Ok(v) => v,
             Err(e) => {
@@ -1296,8 +1337,9 @@ impl InstanceManager {
                         },
                     );
 
-                    let (bcast_tx, _) = broadcast::channel::<Vec<u8>>(BROADCAST_CHANNEL_SIZE);
-                    self.broadcasts.insert(info.id.clone(), bcast_tx.clone());
+                    // 既存チャンネルがあれば必ず再利用する（差し替えると購読中の
+                    // フロントが切り離される。`ensure_broadcast` のコメント参照）。
+                    let bcast_tx = self.ensure_broadcast(&info.id);
 
                     let scrollback_lines = crate::settings::load()
                         .map(|s| s.display.scrollback_lines)
@@ -1529,7 +1571,8 @@ impl InstanceManager {
             self.pending_scrollback.insert(id.to_string(), capture);
         }
 
-        let (bcast_tx, _) = broadcast::channel::<Vec<u8>>(BROADCAST_CHANNEL_SIZE);
+        // 既存チャンネルがあれば必ず再利用する（`ensure_broadcast` のコメント参照）。
+        let bcast_tx = self.ensure_broadcast(id);
         let (raw_tx, raw_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(OUTPUT_CHANNEL_SIZE);
 
         let instance = PtyInstance::reattach_local(tmux_session, raw_tx)?;
@@ -1545,14 +1588,8 @@ impl InstanceManager {
             }
         }
 
-        relay::spawn_relay(
-            self.relay_context(id.to_string()),
-            raw_rx,
-            bcast_tx.clone(),
-            false,
-        );
+        relay::spawn_relay(self.relay_context(id.to_string()), raw_rx, bcast_tx, false);
 
-        self.broadcasts.insert(id.to_string(), bcast_tx);
         self.instances.insert(id.to_string(), instance);
         self.update_status(id, InstanceStatus::Running);
 
@@ -1569,13 +1606,17 @@ impl InstanceManager {
             });
         }
 
-        let bcast_tx = self
-            .broadcasts
-            .get(&id)
-            .ok_or_else(|| anyhow::anyhow!("instance not found: {id}"))?;
+        let bcast_tx = {
+            let guard = self
+                .broadcasts
+                .get(&id)
+                .ok_or_else(|| anyhow::anyhow!("instance not found: {id}"))?;
+            guard.clone()
+        };
 
         let mut rx = bcast_tx.subscribe();
         let iid = id.clone();
+        let broadcasts = Arc::clone(&self.broadcasts);
 
         self.cancel_txs.remove(&id);
 
@@ -1584,26 +1625,47 @@ impl InstanceManager {
 
         tauri::async_runtime::spawn(async move {
             tokio::pin!(cancel_rx);
-            loop {
-                tokio::select! {
-                    _ = &mut cancel_rx => break,
-                    result = rx.recv() => {
-                        match result {
-                            Ok(data) => {
-                                if channel
-                                    .send(OutputPayload {
-                                        instance_id: iid.clone(),
-                                        data,
-                                    })
-                                    .is_err()
-                                {
-                                    break;
+            // 外側ループ = チャンネル差し替えからの自己修復。
+            // `Closed` は「このインスタンスの Sender が全滅した」ときにだけ届く。
+            // マップが Sender を保持している限り Closed にはならないので、
+            // Closed 到達時点でマップは既に「新しい Sender」か「空（close 済み）」の
+            // どちらかに確定している。新しいものがあれば購読を張り直し、
+            // 無ければ終了する。`ensure_broadcast` によって差し替えは起きない建付けだが、
+            // 将来これが破られても画面が黙って死なないための保険として残す。
+            'outer: loop {
+                loop {
+                    tokio::select! {
+                        _ = &mut cancel_rx => break 'outer,
+                        result = rx.recv() => {
+                            match result {
+                                Ok(data) => {
+                                    if channel
+                                        .send(OutputPayload {
+                                            instance_id: iid.clone(),
+                                            data,
+                                        })
+                                        .is_err()
+                                    {
+                                        break 'outer;
+                                    }
                                 }
+                                // 内側ループを抜けて再購読を試みる
+                                Err(broadcast::error::RecvError::Closed) => break,
+                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
                             }
-                            Err(broadcast::error::RecvError::Closed) => break,
-                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         }
                     }
+                }
+
+                match broadcasts.get(&iid) {
+                    Some(tx) => {
+                        eprintln!(
+                            "[ccc] {iid}: 出力チャンネルが差し替わったため購読を張り直します"
+                        );
+                        rx = tx.subscribe();
+                    }
+                    // インスタンスが close された。正常終了。
+                    None => break 'outer,
                 }
             }
         });
@@ -1852,12 +1914,16 @@ impl InstanceManager {
             });
         }
 
-        let bcast_tx = self
-            .shell_broadcasts
-            .get(&id)
-            .ok_or_else(|| anyhow::anyhow!("shell PTY not started: {id}"))?;
+        let bcast_tx = {
+            let guard = self
+                .shell_broadcasts
+                .get(&id)
+                .ok_or_else(|| anyhow::anyhow!("shell PTY not started: {id}"))?;
+            guard.clone()
+        };
         let mut rx = bcast_tx.subscribe();
         let iid = id.clone();
+        let shell_broadcasts = Arc::clone(&self.shell_broadcasts);
 
         self.shell_cancel_txs.remove(&id);
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1865,26 +1931,39 @@ impl InstanceManager {
 
         tauri::async_runtime::spawn(async move {
             tokio::pin!(cancel_rx);
-            loop {
-                tokio::select! {
-                    _ = &mut cancel_rx => break,
-                    result = rx.recv() => {
-                        match result {
-                            Ok(data) => {
-                                if channel
-                                    .send(OutputPayload {
-                                        instance_id: iid.clone(),
-                                        data,
-                                    })
-                                    .is_err()
-                                {
-                                    break;
+            // Agent 側 `subscribe` と同じ自己修復ループ。意図はそちらのコメント参照。
+            'outer: loop {
+                loop {
+                    tokio::select! {
+                        _ = &mut cancel_rx => break 'outer,
+                        result = rx.recv() => {
+                            match result {
+                                Ok(data) => {
+                                    if channel
+                                        .send(OutputPayload {
+                                            instance_id: iid.clone(),
+                                            data,
+                                        })
+                                        .is_err()
+                                    {
+                                        break 'outer;
+                                    }
                                 }
+                                Err(broadcast::error::RecvError::Closed) => break,
+                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
                             }
-                            Err(broadcast::error::RecvError::Closed) => break,
-                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         }
                     }
+                }
+
+                match shell_broadcasts.get(&iid) {
+                    Some(tx) => {
+                        eprintln!(
+                            "[ccc] {iid}: shell 出力チャンネルが差し替わったため購読を張り直します"
+                        );
+                        rx = tx.subscribe();
+                    }
+                    None => break 'outer,
                 }
             }
         });
@@ -2275,6 +2354,44 @@ pub(crate) fn derive_instance_name(host_alias: Option<&str>, directory: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ensure_broadcast ────────────────────────────────────────────────
+    //
+    // 「PTY を張り直しても出力チャンネルは差し替えない」という不変条件を守る。
+    // これが破れると、購読中のフロントが旧 Receiver ごと切り離され、
+    // 入力だけが通って画面が永久に更新されなくなる（v0.12.0 の回帰）。
+
+    #[test]
+    fn ensure_broadcast_reuses_existing_channel() {
+        let mgr = InstanceManager::new();
+
+        // 1 本目を張り、購読者をぶら下げる（＝フロントの subscribe 相当）
+        let first = mgr.ensure_broadcast("inst-1");
+        let mut rx = first.subscribe();
+
+        // PTY 張り直し相当。ここで新規作成されると購読者が切り離される。
+        let second = mgr.ensure_broadcast("inst-1");
+
+        second.send(b"redraw".to_vec()).expect("受信者が居ること");
+        assert_eq!(
+            rx.try_recv().expect("既存の購読者に届くこと"),
+            b"redraw".to_vec(),
+            "ensure_broadcast がチャンネルを差し替えている"
+        );
+    }
+
+    #[test]
+    fn ensure_broadcast_creates_per_instance_channel() {
+        let mgr = InstanceManager::new();
+        let a = mgr.ensure_broadcast("inst-a");
+        let mut rx_b = mgr.ensure_broadcast("inst-b").subscribe();
+
+        a.send(b"for-a".to_vec()).ok();
+        assert!(
+            rx_b.try_recv().is_err(),
+            "別インスタンスの出力が混ざっている"
+        );
+    }
 
     // ── resolve_local_directory ─────────────────────────────────────────
 

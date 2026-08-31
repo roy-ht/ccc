@@ -471,11 +471,26 @@ impl PtyInstance {
                     }
                     Ok(n) => {
                         acc.extend_from_slice(&raw_buf[..n]);
-                        if find_clear_sequence(&acc).is_some() {
+                        if let Some(range) = find_clear_sequence(&acc) {
                             dlog(&format!(
                                 "Phase 2 (attach): clear_sequence 受信 (+{}ms)",
                                 phase2_start.elapsed().as_millis()
                             ));
+                            // reattach（agent_cmd なし）では、このクリアシーケンス
+                            // 以降のバイトが tmux の全画面再描画そのもの。tmux は
+                            // attach 時に一度しか描かないので、ここで捨てると
+                            // **二度と再描画されず画面が固まる**（入力は PTY に
+                            // 通るので「キーが効かない」ように見える）。同じ read で
+                            // 届いた分を必ずフロントへ転送する。
+                            //
+                            // 逆に agent_cmd がある新規起動時は、この後に Phase 4 の
+                            // エコー読み飛ばしが控えているため転送してはいけない。
+                            if agent_cmd.is_none() {
+                                let redraw = acc[range.start..].to_vec();
+                                if !redraw.is_empty() {
+                                    let _ = output_tx.blocking_send(redraw);
+                                }
+                            }
                             acc.clear();
                             // reattach 時（setup_cmds が空）: ここで接続成功を通知
                             if let Some(tx) = ready_tx.take() {

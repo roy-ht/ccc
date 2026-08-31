@@ -132,17 +132,22 @@ pub const MARKER_PREFIX: &[u8] = b"__CCC__";
 
 /// 画面クリア系のエスケープシーケンスを探す。
 /// \x1b[2J (Erase Display) または \x1b[?1049h (Alternate Screen Buffer) を検知。
-/// 見つかった場合、シーケンス終端の次の位置を返す。
-pub fn find_clear_sequence(data: &[u8]) -> Option<usize> {
+/// 見つかった場合、シーケンス自体の範囲（開始位置..終端の次）を返す。
+///
+/// 開始位置も返すのは、attach 検知の呼び出し側が
+/// 「シーケンス以降の全バイト = tmux の再描画本体」をフロントへ転送するため。
+/// 終端位置だけだとクリア指示そのものを落としてしまい、前の画面の残骸が
+/// 新しい描画の下に残る。
+pub fn find_clear_sequence(data: &[u8]) -> Option<std::ops::Range<usize>> {
     let patterns: &[&[u8]] = &[b"\x1b[2J", b"\x1b[?1049h"];
     patterns
         .iter()
         .filter_map(|pattern| {
             data.windows(pattern.len())
                 .position(|w| w == *pattern)
-                .map(|pos| pos + pattern.len())
+                .map(|pos| pos..pos + pattern.len())
         })
-        .min()
+        .min_by_key(|r| r.end)
 }
 
 /// "__CCC__" マーカーを探し、直後の終了コード文字を返す。
@@ -223,20 +228,28 @@ mod tests {
     #[test]
     fn test_find_clear_erase_display() {
         let data = b"some text\x1b[2Jmore text";
-        assert_eq!(find_clear_sequence(data), Some(13)); // "\x1b[2J" の直後
+        assert_eq!(find_clear_sequence(data), Some(9..13)); // "\x1b[2J" 自体の範囲
     }
 
     #[test]
     fn test_find_clear_alternate_screen() {
         let data = b"some text\x1b[?1049hmore text";
-        assert_eq!(find_clear_sequence(data), Some(17)); // "\x1b[?1049h" の直後
+        assert_eq!(find_clear_sequence(data), Some(9..17)); // "\x1b[?1049h" 自体の範囲
     }
 
     #[test]
     fn test_find_clear_both_returns_earliest() {
         // 両方のパターンがある場合、最も早い位置を返す
         let data = b"\x1b[?1049h\x1b[2J";
-        assert_eq!(find_clear_sequence(data), Some(8)); // alternate screen が先
+        assert_eq!(find_clear_sequence(data), Some(0..8)); // alternate screen が先
+    }
+
+    #[test]
+    fn test_find_clear_range_keeps_redraw_payload() {
+        // 呼び出し側は range.start 以降を「クリア + 再描画本体」として転送する。
+        let data = b"junk\x1b[2J\x1b[Hscreen redraw payload";
+        let r = find_clear_sequence(data).expect("見つかること");
+        assert_eq!(&data[r.start..], b"\x1b[2J\x1b[Hscreen redraw payload");
     }
 
     #[test]

@@ -68,7 +68,14 @@ function App() {
   // ウィンドウ描画前に復元するとコンテナサイズが 0 で fit() が効かないため。
   // restore_instances は復元完了後の一覧を戻り値で返すので、それを直接 setInstances する。
   // event 駆動だと listen() 登録が遅れた場合に取り逃して一覧が空のままになる race があった。
+  // 復元は 1 プロセス 1 回きり。StrictMode の二重呼び出しや依存の同一性崩れで
+  // 再実行されると、生きているインスタンスに PTY をもう一本張ってしまい、
+  // 旧世代の破棄を通じて「入力は通るが画面が更新されない」状態を招く。
+  // バックエンド側にも同じガードがあるが、無駄な往復を避けるため手前でも止める。
+  const restoreStartedRef = useRef(false);
   useEffect(() => {
+    if (restoreStartedRef.current) return;
+    restoreStartedRef.current = true;
     invoke("show_main_window")
       .then(() => invoke<InstanceInfo[]>("restore_instances"))
       .then((restored) => {
