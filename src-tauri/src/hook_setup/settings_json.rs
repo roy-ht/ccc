@@ -10,6 +10,12 @@
 //! 一意マーカーとして判定する。新規 merge では現行値 `HOOK_BINARY_COMMAND`
 //! (= wrapper script) に正規化するため、旧バイナリ直叩き形式から
 //! ラッパー方式への自動マイグレーションも兼ねる。
+//!
+//! 正規化の際、同一 event に複数の ccc エントリが並んでいたら 1 件に畳む。
+//! command 表記を変更したバージョン（バイナリ直叩き → wrapper）で
+//! 「旧エントリを検出できず新エントリを追加」→「後続バージョンが両方を
+//! 同じ command に正規化」という経路で完全同一のエントリが 2 件残った実績が
+//! あるため、merge のたびに自己修復させる。
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -71,8 +77,10 @@ pub fn merge_into_config_dir(config_dir: &Path) -> Result<bool> {
 /// 何か変更があれば true を返す。
 ///
 /// 各 event について、ccc 由来の既存エントリ（command の basename が
-/// `ccc-claude-code-hook`）が見つかった場合は command を `hook_cmd` に正規化する。
-/// これにより旧形式 `~/.ccc/bin/...` から絶対パスへの自動マイグレーションを行う。
+/// `ccc-hook.sh` / `ccc-claude-code-hook`）が見つかった場合は command を
+/// `hook_cmd` に正規化し、2 件目以降の ccc エントリは取り除いて 1 件に畳む。
+/// これにより旧形式からの自動マイグレーションと、過去バージョンが作った
+/// 重複登録の自己修復を同時に行う。
 pub fn merge_into(root: &mut Value, hook_cmd: &str) -> bool {
     if !root.is_object() {
         *root = Value::Object(Default::default());
@@ -95,9 +103,8 @@ pub fn merge_into(root: &mut Value, hook_cmd: &str) -> bool {
         }
         let entries = arr.as_array_mut().expect("entries is array");
 
-        if normalize_ccc_hook_commands(entries, hook_cmd) {
+        if normalize_ccc_entries(entries, event, hook_cmd) {
             changed = true;
-            continue;
         }
 
         if !contains_ccc_hook(entries) {
@@ -109,49 +116,123 @@ pub fn merge_into(root: &mut Value, hook_cmd: &str) -> bool {
     changed
 }
 
-/// 既存の ccc 由来エントリの command を `hook_cmd` に揃える。
-/// 既に揃っているか ccc エントリが無い場合は false を返す（変更なし）。
-fn normalize_ccc_hook_commands(entries: &mut [Value], hook_cmd: &str) -> bool {
-    let mut changed = false;
-    let mut found_ccc = false;
-    for entry in entries.iter_mut() {
-        let Some(hooks) = entry.get_mut("hooks").and_then(|v| v.as_array_mut()) else {
-            continue;
-        };
-        for h in hooks {
-            let Some(cmd) = h.get("command").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            if command_is_ccc_hook(cmd) {
-                found_ccc = true;
-                if cmd != hook_cmd {
-                    h["command"] = Value::String(hook_cmd.to_string());
-                    changed = true;
-                }
-            }
-        }
+/// 1 event 分のエントリ列について、ccc 由来エントリを 1 件に畳みつつ
+/// command を `hook_cmd` に揃える。ccc エントリが無い場合や既に整っている
+/// 場合は false を返す（変更なし）。
+///
+/// 残すエントリは「その event で ccc が本来書く matcher と一致するもの」を
+/// 優先し、無ければ先頭の ccc エントリ。残さない側からは ccc の hook だけを
+/// 取り除くので、同じエントリに同居している他用途 hook は保護される。
+fn normalize_ccc_entries(entries: &mut Vec<Value>, event: &str, hook_cmd: &str) -> bool {
+    let ccc_indices: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry_has_ccc_hook(entry))
+        .map(|(i, _)| i)
+        .collect();
+    if ccc_indices.is_empty() {
+        return false;
     }
-    // ccc エントリが存在しなければ false を返し、上位で新規追加に進ませる。
-    found_ccc && changed
+
+    let canonical = canonical_matcher(event);
+    let keep = ccc_indices
+        .iter()
+        .copied()
+        .find(|&i| entry_matcher(&entries[i]) == canonical)
+        .unwrap_or(ccc_indices[0]);
+
+    let mut changed = false;
+    for i in ccc_indices {
+        changed |= if i == keep {
+            retain_single_ccc_hook(&mut entries[i], hook_cmd)
+        } else {
+            strip_ccc_hooks(&mut entries[i])
+        };
+    }
+
+    // ccc hook を剥がした結果、実行するものが無くなったエントリは捨てる。
+    let before = entries.len();
+    entries.retain(|entry| !has_empty_hooks(entry));
+    changed || entries.len() != before
+}
+
+/// 残す ccc エントリ側の処理: 最初の ccc hook を `hook_cmd` に正規化し、
+/// 同一エントリ内に重複している 2 件目以降の ccc hook を取り除く。
+fn retain_single_ccc_hook(entry: &mut Value, hook_cmd: &str) -> bool {
+    let Some(hooks) = entry.get_mut("hooks").and_then(|v| v.as_array_mut()) else {
+        return false;
+    };
+    let mut changed = false;
+    let mut seen = false;
+    hooks.retain_mut(|h| {
+        if !hook_is_ccc(h) {
+            return true;
+        }
+        if seen {
+            changed = true;
+            return false;
+        }
+        seen = true;
+        if h.get("command").and_then(|v| v.as_str()) != Some(hook_cmd) {
+            h["command"] = Value::String(hook_cmd.to_string());
+            changed = true;
+        }
+        true
+    });
+    changed
+}
+
+/// 畳まれる側のエントリから ccc hook だけを取り除く。
+fn strip_ccc_hooks(entry: &mut Value) -> bool {
+    let Some(hooks) = entry.get_mut("hooks").and_then(|v| v.as_array_mut()) else {
+        return false;
+    };
+    let before = hooks.len();
+    hooks.retain(|h| !hook_is_ccc(h));
+    hooks.len() != before
+}
+
+fn hook_is_ccc(hook: &Value) -> bool {
+    hook.get("command")
+        .and_then(|v| v.as_str())
+        .map(command_is_ccc_hook)
+        .unwrap_or(false)
+}
+
+fn entry_has_ccc_hook(entry: &Value) -> bool {
+    entry
+        .get("hooks")
+        .and_then(|v| v.as_array())
+        .map(|hooks| hooks.iter().any(hook_is_ccc))
+        .unwrap_or(false)
+}
+
+fn entry_matcher(entry: &Value) -> Option<&str> {
+    entry.get("matcher").and_then(|v| v.as_str())
+}
+
+/// `make_ccc_entry` が書き込む matcher。畳むときにどのエントリを残すかの判定に使う。
+fn canonical_matcher(event: &str) -> Option<&'static str> {
+    match event {
+        "PreToolUse" | "PostToolUse" => Some("*"),
+        _ => None,
+    }
+}
+
+/// hooks が空配列になったエントリ（= 何も実行しない残骸）かどうか。
+/// hooks キー自体が無い/配列でないエントリは判断できないので残す。
+fn has_empty_hooks(entry: &Value) -> bool {
+    entry
+        .get("hooks")
+        .and_then(|v| v.as_array())
+        .map(|hooks| hooks.is_empty())
+        .unwrap_or(false)
 }
 
 /// ccc の hook 定義が既に含まれているかチェック。
 /// command の basename が `ccc-claude-code-hook` であるエントリを ccc 由来とみなす。
 fn contains_ccc_hook(entries: &[Value]) -> bool {
-    entries.iter().any(|entry| {
-        entry
-            .get("hooks")
-            .and_then(|v| v.as_array())
-            .map(|hooks| {
-                hooks.iter().any(|h| {
-                    h.get("command")
-                        .and_then(|v| v.as_str())
-                        .map(command_is_ccc_hook)
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false)
-    })
+    entries.iter().any(entry_has_ccc_hook)
 }
 
 fn command_is_ccc_hook(cmd: &str) -> bool {
@@ -286,6 +367,106 @@ mod tests {
         assert!(command_is_ccc_hook("ccc-claude-code-hook"));
         assert!(!command_is_ccc_hook("/usr/bin/other-hook"));
         assert!(!command_is_ccc_hook(""));
+    }
+
+    #[test]
+    fn merge_collapses_identical_duplicate_entries() {
+        // 過去バージョンが作った「完全同一の 2 エントリ」を 1 件に畳む。
+        let mut v = json!({
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "*", "hooks": [{ "type": "command", "command": TEST_CMD }] },
+                    { "matcher": "*", "hooks": [{ "type": "command", "command": TEST_CMD }] }
+                ]
+            }
+        });
+        let changed = merge_into(&mut v, TEST_CMD);
+        assert!(changed, "重複解消は変更として報告される");
+        assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+        assert!(!merge_into(&mut v, TEST_CMD), "畳んだ後は冪等");
+    }
+
+    #[test]
+    fn merge_collapses_legacy_and_current_entries() {
+        // 「旧 command のエントリ + 現行 command のエントリ」が並んでいたら、
+        // 正規化してから 1 件に畳む（両方を同じ command に書き換えて放置しない）。
+        let mut v = json!({
+            "hooks": {
+                "Stop": [
+                    { "hooks": [{ "type": "command", "command": "~/.ccc/bin/ccc-claude-code-hook" }] },
+                    { "hooks": [{ "type": "command", "command": TEST_CMD }] }
+                ]
+            }
+        });
+        let changed = merge_into(&mut v, TEST_CMD);
+        assert!(changed);
+        let arr = v["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["hooks"][0]["command"].as_str(), Some(TEST_CMD));
+    }
+
+    #[test]
+    fn merge_keeps_canonical_matcher_entry_when_collapsing() {
+        // matcher 違いの ccc エントリが混ざっていたら、ccc が本来書く
+        // matcher (`*`) のエントリを残す。
+        let mut v = json!({
+            "hooks": {
+                "PostToolUse": [
+                    { "matcher": "Bash", "hooks": [{ "type": "command", "command": TEST_CMD }] },
+                    { "matcher": "*", "hooks": [{ "type": "command", "command": TEST_CMD }] }
+                ]
+            }
+        });
+        merge_into(&mut v, TEST_CMD);
+        let arr = v["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["matcher"], "*");
+    }
+
+    #[test]
+    fn merge_collapse_preserves_other_hooks_in_same_entry() {
+        // 畳む側のエントリに他用途 hook が同居していたら、そちらは残す。
+        let mut v = json!({
+            "hooks": {
+                "Stop": [
+                    { "hooks": [{ "type": "command", "command": TEST_CMD }] },
+                    { "hooks": [
+                        { "type": "command", "command": TEST_CMD },
+                        { "type": "command", "command": "claude-notify" }
+                    ]}
+                ]
+            }
+        });
+        merge_into(&mut v, TEST_CMD);
+        let arr = v["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["hooks"].as_array().unwrap().len(), 1);
+        assert_eq!(arr[1]["hooks"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            arr[1]["hooks"][0]["command"].as_str(),
+            Some("claude-notify"),
+            "他用途 hook は残る"
+        );
+    }
+
+    #[test]
+    fn merge_collapses_duplicates_inside_single_entry() {
+        // 同一エントリ内に ccc hook が 2 つ並ぶケースも 1 つに畳む。
+        let mut v = json!({
+            "hooks": {
+                "SessionStart": [
+                    { "hooks": [
+                        { "type": "command", "command": TEST_CMD },
+                        { "type": "command", "command": TEST_CMD }
+                    ]}
+                ]
+            }
+        });
+        let changed = merge_into(&mut v, TEST_CMD);
+        assert!(changed);
+        let arr = v["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["hooks"].as_array().unwrap().len(), 1);
     }
 
     #[test]
