@@ -89,10 +89,18 @@ pub fn run() {
             app.manage(archive_commands::ArchiveSyncClock(sync_clock));
 
             // hook バイナリをローカル `~/.ccc/bin/` に配信する。
-            match hook_setup::binary::install_local() {
+            match hook_setup::binary::install_local(hook_setup::binary::HOOK) {
                 Ok(true) => eprintln!("[ccc] hook バイナリを更新しました"),
                 Ok(false) => {}
                 Err(e) => eprintln!("[ccc] hook バイナリ配信に失敗: {e}"),
+            }
+            // gpg relay をリモートへ配る用に `~/.ccc/bin/remote/<platform>/` へ展開する。
+            // 同梱リソースを持つのは GUI だけなので、ここで置いておくと
+            // `ccc-ssh` 単独でもリモートへ配信できる（specs/v0.14 §4）。
+            match hook_setup::binary::stage_remote_payload(hook_setup::binary::GPG_RELAY) {
+                Ok(0) => eprintln!("[ccc] gpg relay の配信用バイナリが見つかりません"),
+                Ok(n) => eprintln!("[ccc] gpg relay の配信用バイナリを {n} 種類配置しました"),
+                Err(e) => eprintln!("[ccc] gpg relay の配置に失敗: {e}"),
             }
             // 既存の全 Claude プロファイル（`~/.ccc/agent_settings/claude/*/`）の
             // settings.json に hook 定義を冪等マージする。restore 経由で

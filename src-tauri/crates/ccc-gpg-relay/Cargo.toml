@@ -1,0 +1,22 @@
+[package]
+name = "ccc-gpg-relay"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "gpg agent forward の relay デーモンと多重化プロトコル（リモート常駐バイナリ + ローカル uplink 共用ライブラリ）"
+
+[lib]
+name = "ccc_gpg_relay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ccc-gpg-relay"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"

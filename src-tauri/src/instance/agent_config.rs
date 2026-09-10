@@ -78,7 +78,7 @@ pub fn prepare_remote_claude_config(
     // settings.json の `command` がチルダ表記でリモート側でホーム展開されるため、
     // バイナリ自体もリモートのホームに置く必要がある。
     let hook_install_start = Instant::now();
-    match hook_setup::binary::install_remote(host_alias) {
+    match hook_setup::binary::install_remote(hook_setup::binary::HOOK, host_alias) {
         Ok(true) => debug_log::append(
             log_path,
             &format!(

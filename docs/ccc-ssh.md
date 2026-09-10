@@ -31,7 +31,8 @@ ControlMaster・同じソケット** に相乗りし、追加で行うのは冪�
 | `ccc-ssh fwd add <host> <listen>:<host>:<port>` | `-L` 形式で forward 追加 + 台帳記録 |
 | `ccc-ssh fwd rm <host> <listen_port>` | ccc 台帳の forward を削除 |
 | `ccc-ssh down <host>` | 安全な master 終了（`-O exit`。無応答なら kill フォールバック） |
-| `ccc-ssh heal <host>` | master 死活診断 + gpg agent forward 修復と台帳リプレイを即時実行 |
+| `ccc-ssh heal <host>` | master 死活診断 + 台帳リプレイ + gpg uplink の張り直し |
+| `ccc-ssh gpg <サブコマンド>` | gpg agent forward（relay 方式）。下記参照 |
 
 ## pre-connect フック
 
@@ -44,8 +45,8 @@ ControlMaster・同じソケット** に相乗りし、追加で行うのは冪�
    フックが固まることはない
 2. **世代ゲート**: 前回疎通確認済みの master pid とキャッシュを照合。
    pid 不変ならリモート実行ゼロで即 exec（common case は数 ms）
-3. **gpg agent forward の健全性チェック**: `--no-autostart` 付き
-   `getinfo socket_name` の応答分類で健全性を判定。不調時のみ修復
+3. **gpg relay の uplink 確認**: 常駐 uplink が居ることを保証する
+   （flock を試すだけで数 ms、リモート実行なし）
 4. **forward 台帳のリプレイ**: master 世代交代を検知したら、台帳に登録済みの
    `-L` を全件冪等リプレイ
 
@@ -68,9 +69,58 @@ Host mybox
     ExitOnForwardFailure yes
 ```
 
-gpg agent forward（RemoteForward の unix socket）を使うホストでは、リモートの
-`sshd_config` に `StreamLocalBindUnlink yes` を入れると残骸ソケットによる
-bind 失敗が根本的に消えます（サーバ側にしか効かない設定）。
+## gpg agent forward（relay 方式）
+
+v0.14 で、ssh の `RemoteForward` に相乗りする方式をやめました。リモートに常駐する
+`ccc-gpg-relay` が `~/.gnupg/S.gpg-agent` を**所有し続け**、ローカルの uplink が
+ssh の stdio 1 本で多重化して繋ぎます。ssh 接続の生死と socket ファイルの寿命が
+分離されるため、「接続は健全なのに gpg が使えない」状態が構造的に起きません。
+設計の詳細は `specs/v0.14-gpg-relay.md`。
+
+| コマンド | 動作 |
+|---|---|
+| `ccc-ssh gpg enable <host>` | このホストで relay を有効にする |
+| `ccc-ssh gpg disable <host>` | 無効にする（uplink が動いていれば停止） |
+| `ccc-ssh gpg up <host>` | uplink を起動（既に居れば何もしない） |
+| `ccc-ssh gpg down <host>` | uplink を停止 |
+| `ccc-ssh gpg status [<host>]` | 状態を表示（省略時は有効な全ホスト） |
+| `ccc-ssh gpg list` | 設定済みホストの一覧 |
+| `ccc-ssh gpg doctor <host>` | 移行漏れ・前提条件を診断 |
+
+### 設定
+
+`~/.ccc/gpg.json`（`CCC_DEV=1` なら `~/.ccc/dev/gpg.json`）に全ホスト分を持ちます。
+
+```json
+{
+  "schema": 1,
+  "defaults": { "grace_secs": 5 },
+  "hosts": {
+    "mybox": { "enabled": true },
+    "container-host": {
+      "enabled": true,
+      "remote_socket": "/run/user/1000/gnupg/S.gpg-agent"
+    }
+  }
+}
+```
+
+省略した項目は `defaults` → 組み込み既定の順に解決されるので、通常は
+`{"enabled": true}` だけで足ります（`ccc-ssh gpg enable` が書きます）。
+
+### 移行時の必須手順
+
+**`~/.ssh/config` から gpg 用の `RemoteForward` 行を削除してください。**
+残っていると、素の `ssh` で接続した瞬間に sshd が relay の socket を上書きします。
+`ccc-ssh gpg doctor <host>` が検出して警告します。
+
+リモートの `sshd_config` に `AllowStreamLocalForwarding no` を入れておくと、
+クライアント側の設定ミスに関係なく socket が守られます。relay 方式では
+streamlocal forward を一切使わないため、無効化しても副作用はありません
+（`ForwardAgent` は別の設定項目、`-L`/`-R` の TCP forward も無関係）。
+
+リモートの `~/.gnupg/gpg.conf` に `no-autostart` を入れておくと、鍵を持たない
+gpg-agent が socket を奪う事故を防げます。
 
 ## 使用例
 
@@ -100,3 +150,5 @@ ccc-ssh heal mybox
   （修復は次の `ccc-ssh` / ccc GUI 操作時に走る）
 - `ssh` の全オプションの完全解釈（value を取る主要オプションのみ対応し、
   解釈不能なら透過実行にフォールバック）
+- 1 リモートホストにつき gpg socket は 1 本。複数マシンの ccc から同時に繋いだ
+  場合は後勝ちになり、先客の gpg 操作は切れる

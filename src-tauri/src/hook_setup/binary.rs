@@ -11,9 +11,29 @@ use std::process::Command;
 
 use super::hook_bin_dir;
 
-/// 期待される hook バイナリのバージョン。
-/// `ccc-claude-code-hook` crate の version と同期。
-pub const EXPECTED_VERSION: &str = "0.3.0";
+/// 配信する 1 バイナリの仕様。
+///
+/// v0.14 で gpg relay が加わり、配信対象が 2 つになった。名前と期待バージョン
+/// だけが違い、探索・配信の手順は完全に共通なので spec で切り替える。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BinarySpec {
+    /// バイナリ名（同梱ディレクトリ名・配信先ファイル名を兼ねる）
+    pub name: &'static str,
+    /// 期待するバージョン（`--version` 出力の最後のトークンと突き合わせる）
+    pub version: &'static str,
+}
+
+/// Claude Code の hook ブリッジ。`ccc-claude-code-hook` crate の version と同期。
+pub const HOOK: BinarySpec = BinarySpec {
+    name: "ccc-claude-code-hook",
+    version: "0.3.0",
+};
+
+/// gpg agent forward の relay（specs/v0.14）。
+pub const GPG_RELAY: BinarySpec = BinarySpec {
+    name: "ccc-gpg-relay",
+    version: ccc_gpg_relay::VERSION,
+};
 
 /// プラットフォーム識別子。`ccc-claude-code-hook` の `--platform` 出力と整合させる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +87,7 @@ impl Platform {
 /// macOS の場合 `ccc.app/Contents/Resources/binaries/...` に配置される。
 /// 開発時は `cargo build` の出力ディレクトリと、`just prepare-hook(-all)`
 /// で生成される `<repo>/src-tauri/binaries/...` をフォールバックとして探す。
-fn bundled_binary_search_paths(platform: Platform) -> Result<Vec<PathBuf>> {
+fn bundled_binary_search_paths(spec: BinarySpec, platform: Platform) -> Result<Vec<PathBuf>> {
     let exe = std::env::current_exe()?;
     let exe_dir = exe
         .parent()
@@ -81,9 +101,9 @@ fn bundled_binary_search_paths(platform: Platform) -> Result<Vec<PathBuf>> {
             contents_dir
                 .join("Resources")
                 .join("binaries")
-                .join("ccc-claude-code-hook")
+                .join(spec.name)
                 .join(platform.as_str())
-                .join("ccc-claude-code-hook"),
+                .join(spec.name),
         );
     }
 
@@ -91,9 +111,9 @@ fn bundled_binary_search_paths(platform: Platform) -> Result<Vec<PathBuf>> {
     candidates.push(
         exe_dir
             .join("binaries")
-            .join("ccc-claude-code-hook")
+            .join(spec.name)
             .join(platform.as_str())
-            .join("ccc-claude-code-hook"),
+            .join(spec.name),
     );
 
     // 3) 開発時の prepare-hook 配置先 (`<repo>/src-tauri/binaries/ccc-claude-code-hook/<platform>/`)
@@ -102,18 +122,18 @@ fn bundled_binary_search_paths(platform: Platform) -> Result<Vec<PathBuf>> {
         candidates.push(
             src_tauri_dir
                 .join("binaries")
-                .join("ccc-claude-code-hook")
+                .join(spec.name)
                 .join(platform.as_str())
-                .join("ccc-claude-code-hook"),
+                .join(spec.name),
         );
     }
 
     // 4) ホスト用は cargo build の出力場所もフォールバックとして見る
     if platform == Platform::host()? {
-        candidates.push(exe_dir.join("ccc-claude-code-hook"));
+        candidates.push(exe_dir.join(spec.name));
         if let Some(target_dir) = exe_dir.parent() {
-            candidates.push(target_dir.join("debug").join("ccc-claude-code-hook"));
-            candidates.push(target_dir.join("release").join("ccc-claude-code-hook"));
+            candidates.push(target_dir.join("debug").join(spec.name));
+            candidates.push(target_dir.join("release").join(spec.name));
         }
     }
 
@@ -121,20 +141,21 @@ fn bundled_binary_search_paths(platform: Platform) -> Result<Vec<PathBuf>> {
 }
 
 /// 同梱バイナリのうち、最初に見つかった実在パスを返す。
-pub fn bundled_binary(platform: Platform) -> Result<PathBuf> {
-    for cand in bundled_binary_search_paths(platform)? {
+pub fn bundled_binary(spec: BinarySpec, platform: Platform) -> Result<PathBuf> {
+    for cand in bundled_binary_search_paths(spec, platform)? {
         if cand.is_file() {
             return Ok(cand);
         }
     }
     Err(anyhow!(
-        "{} 用の同梱バイナリが見つかりません（src-tauri/binaries/ccc-claude-code-hook/{}/ に配置してください）",
+        "{} 用の同梱バイナリが見つかりません（src-tauri/binaries/{}/{}/ に配置してください）",
         platform.as_str(),
+        spec.name,
         platform.as_str()
     ))
 }
 
-/// 既存の `~/.ccc/bin/ccc-claude-code-hook` の `--version` 出力を取得。
+/// 既存の `~/.ccc/bin/<name>` の `--version` 出力を取得。
 /// バイナリが存在しない／実行失敗なら None。
 fn local_installed_version(path: &Path) -> Option<String> {
     if !path.exists() {
@@ -145,24 +166,24 @@ fn local_installed_version(path: &Path) -> Option<String> {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    // `clap` のデフォルト形式は "ccc-claude-code-hook X.Y.Z"
+    // `clap` のデフォルト形式は "<name> X.Y.Z"
     s.split_whitespace().last().map(String::from)
 }
 
-/// ローカル `~/.ccc/bin/ccc-claude-code-hook` を最新バイナリで上書きする。
+/// ローカル `~/.ccc/bin/<name>` を最新バイナリで上書きする。
 /// バージョンが既に最新なら何もせず Ok(false) を返す。
-pub fn install_local() -> Result<bool> {
+pub fn install_local(spec: BinarySpec) -> Result<bool> {
     let target_dir = hook_bin_dir()?;
     std::fs::create_dir_all(&target_dir)
         .with_context(|| format!("ディレクトリ作成失敗: {}", target_dir.display()))?;
-    let target_path = target_dir.join("ccc-claude-code-hook");
+    let target_path = target_dir.join(spec.name);
 
-    if local_installed_version(&target_path).as_deref() == Some(EXPECTED_VERSION) {
+    if local_installed_version(&target_path).as_deref() == Some(spec.version) {
         return Ok(false);
     }
 
     let host = Platform::host()?;
-    let src = bundled_binary(host)?;
+    let src = bundled_binary(spec, host)?;
     std::fs::copy(&src, &target_path)
         .with_context(|| format!("コピー失敗: {} → {}", src.display(), target_path.display()))?;
 
@@ -174,6 +195,60 @@ pub fn install_local() -> Result<bool> {
         std::fs::set_permissions(&target_path, perms)?;
     }
     Ok(true)
+}
+
+/// リモートへ配る用に、**全プラットフォーム分**を
+/// `~/.ccc/bin/remote/<platform>/<name>` へ展開する。戻り値は配置できた数。
+///
+/// 同梱リソース（`.app/Contents/Resources/binaries/...`）を持っているのは GUI 本体
+/// だけなので、GUI 起動時にここへ置いておく。こうすると **`ccc-ssh` 単独でも**
+/// リモートへ配信でき、GUI の起動有無に依存しなくなる（specs/v0.14 §4）。
+///
+/// 見つからないプラットフォームは黙って飛ばす（開発時は host 用しか無いことが多い）。
+pub fn stage_remote_payload(spec: BinarySpec) -> Result<usize> {
+    let base = hook_bin_dir()?.join("remote");
+    let mut staged = 0usize;
+    for platform in [
+        Platform::DarwinArm64,
+        Platform::LinuxArm64,
+        Platform::LinuxAmd64,
+    ] {
+        let Ok(src) = bundled_binary(spec, platform) else {
+            continue;
+        };
+        let dir = base.join(platform.as_str());
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("ディレクトリ作成失敗: {}", dir.display()))?;
+        let dest = dir.join(spec.name);
+        // 同一内容なら触らない（毎起動のコピーを避ける）
+        if same_file_contents(&src, &dest) {
+            staged += 1;
+            continue;
+        }
+        std::fs::copy(&src, &dest)
+            .with_context(|| format!("コピー失敗: {} → {}", src.display(), dest.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&dest)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&dest, perms)?;
+        }
+        staged += 1;
+    }
+    Ok(staged)
+}
+
+/// サイズと更新時刻で同一とみなす（内容比較まではしない）。
+fn same_file_contents(a: &Path, b: &Path) -> bool {
+    let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return false;
+    };
+    ma.len() == mb.len()
+        && match (ma.modified(), mb.modified()) {
+            (Ok(ta), Ok(tb)) => ta == tb,
+            _ => false,
+        }
 }
 
 /// リモートホストの `uname -sm` を取得して Platform を判定する。
@@ -195,14 +270,17 @@ pub fn detect_remote_platform(host_alias: &str) -> Result<Platform> {
 /// リモートに `~/.ccc/bin/ccc-claude-code-hook` を配信する。
 ///
 /// 既に存在しバージョンが最新なら何もしない。
-pub fn install_remote(host_alias: &str) -> Result<bool> {
+pub fn install_remote(spec: BinarySpec, host_alias: &str) -> Result<bool> {
     let platform = detect_remote_platform(host_alias)?;
+    let remote_path = format!("~/.ccc/bin/{}", spec.name);
 
     // 既にインストール済みでバージョンが一致するか確認
     let check = Command::new("ssh")
         .args([
-            "-o", "BatchMode=yes", host_alias,
-            "test -x ~/.ccc/bin/ccc-claude-code-hook && ~/.ccc/bin/ccc-claude-code-hook --version || true",
+            "-o",
+            "BatchMode=yes",
+            host_alias,
+            &format!("test -x {remote_path} && {remote_path} --version || true"),
         ])
         .output()
         .with_context(|| format!("ssh version check 失敗 (host={host_alias})"))?;
@@ -210,36 +288,45 @@ pub fn install_remote(host_alias: &str) -> Result<bool> {
         .split_whitespace()
         .last()
         .map(String::from);
-    if remote_version.as_deref() == Some(EXPECTED_VERSION) {
+    if remote_version.as_deref() == Some(spec.version) {
         return Ok(false);
     }
 
     // ディレクトリを作成
     let mkdir = Command::new("ssh")
-        .args([host_alias, "mkdir -p ~/.ccc/bin"])
+        .args(["-o", "BatchMode=yes", host_alias, "mkdir -p ~/.ccc/bin"])
         .status()
         .with_context(|| format!("ssh mkdir 失敗 (host={host_alias})"))?;
     if !mkdir.success() {
         return Err(anyhow!("リモートに ~/.ccc/bin を作成できませんでした"));
     }
 
-    let src = bundled_binary(platform)?;
+    // 実行中のバイナリを上書きすると ETXTBSY になり得るため、一時名で置いてから
+    // rename する（rename は同一ディレクトリ内なので atomic）。既に動いている
+    // 旧世代プロセスは自分の inode を持ったまま動き続け、次の起動から新版になる
+    let src = bundled_binary(spec, platform)?;
+    let tmp_remote = format!(".ccc/bin/{}.new", spec.name);
     let scp_status = Command::new("scp")
         .args(["-q", "-p"])
         .arg(&src)
-        .arg(format!("{host_alias}:.ccc/bin/ccc-claude-code-hook"))
+        .arg(format!("{host_alias}:{tmp_remote}"))
         .status()
         .with_context(|| "scp 実行失敗".to_string())?;
     if !scp_status.success() {
         return Err(anyhow!("scp が失敗: {scp_status}"));
     }
 
-    let chmod = Command::new("ssh")
-        .args([host_alias, "chmod 755 ~/.ccc/bin/ccc-claude-code-hook"])
+    let finalize = Command::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            host_alias,
+            &format!("chmod 755 ~/{tmp_remote} && mv -f ~/{tmp_remote} {remote_path}"),
+        ])
         .status()
-        .with_context(|| "ssh chmod 失敗".to_string())?;
-    if !chmod.success() {
-        return Err(anyhow!("リモート chmod が失敗"));
+        .with_context(|| "ssh chmod/mv 失敗".to_string())?;
+    if !finalize.success() {
+        return Err(anyhow!("リモートでの配置に失敗しました"));
     }
     Ok(true)
 }

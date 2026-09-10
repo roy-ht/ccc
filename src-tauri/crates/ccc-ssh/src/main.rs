@@ -1,7 +1,7 @@
 //! ccc-ssh: ssh ラッパー CLI。
 //!
-//! - サブコマンド（`fwd` / `down` / `heal`）以外はすべて素の ssh へ透過する。
-//!   透過前に pre-connect フック（gpg agent forward の世代ゲート付きチェック＋
+//! - サブコマンド（`fwd` / `down` / `heal` / `gpg`）以外はすべて素の ssh へ透過する。
+//!   透過前に pre-connect フック（master の死活復旧・gpg relay の uplink 確認・
 //!   port forward 台帳のリプレイ）を実行する
 //! - 素の ssh と同じ config・ControlMaster・ソケットに相乗りするだけなので、
 //!   素の ssh と併用しても安全（台帳に載せた forward の削除だけは ccc 側で行う）
@@ -11,8 +11,10 @@ use std::process::Command;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
+mod gpg;
+
 use ccc_sshkit::liveness::{self, MasterLiveness};
-use ccc_sshkit::{agent_socket, forwards, ssh_config};
+use ccc_sshkit::{forwards, gpg_uplink, ssh_config};
 
 /// 親（ccc-ssh 自身）が受けたシグナルを子（ssh）に転送するために共有する PID。
 /// シグナルハンドラから async-signal-safe に読み書きしたいので AtomicI32。
@@ -25,6 +27,8 @@ fn main() {
         Some("fwd") => cmd_fwd(&args[1..]),
         Some("down") => cmd_down(&args[1..]),
         Some("heal") => cmd_heal(&args[1..]),
+        Some("gpg") => gpg::dispatch(&args[1..]),
+        Some("gpg-uplink") => gpg::run_uplink_daemon(&args[1..]),
         Some("--ccc-help") | None => {
             print_help();
             0
@@ -36,7 +40,7 @@ fn main() {
 
 fn print_help() {
     eprintln!(
-        "ccc-ssh: port forward 台帳と gpg agent forward 修復を仕込んだ ssh ラッパー
+        "ccc-ssh: port forward 台帳と gpg agent forward（relay 方式）を仕込んだ ssh ラッパー
 
 使い方:
   ccc-ssh <ssh引数...>                  pre-connect フック後に ssh へ透過
@@ -44,11 +48,8 @@ fn print_help() {
   ccc-ssh fwd add <host> <L:H:P|port>   forward 追加（例: 8080:localhost:80、port のみなら同番転送）
   ccc-ssh fwd rm <host> <listen_port>   ccc 台帳の forward を削除
   ccc-ssh down <host>                   master を安全に終了（-O exit。無応答なら kill まで行う）
-  ccc-ssh heal <host>                   強制的にリモート forward socket を張り直す（gpg forward が
-                                        「check は通るのに実際は切れている」ケース対応。健全な forward
-                                        も一瞬切断されて即再バインドされます）。mux で直らない場合
-                                        （master 起動時に bind 失敗した forward）は master を世代交代
-                                        （-O stop → 再確立。既存セッションは維持）して張り直します
+  ccc-ssh gpg <サブコマンド>            gpg agent forward（relay 方式）。詳細は ccc-ssh gpg
+  ccc-ssh heal <host>                   master の死活復旧 + 台帳リプレイ + gpg uplink の張り直し
 
 pre-connect フックは網断で half-open になった master も検知し、自動で畳んで
 再確立します（ユーザー ControlMaster 設定時は ssh -N -f で復旧）。
@@ -175,11 +176,13 @@ fn pre_connect_hook(host: &str) {
         }
     };
     preflight_master(host, &log);
-    // gpg forward の check → 修復。mux で直らない場合（master 起動時に bind 失敗した
-    // config RemoteForward）は、ユーザー CM モードなら master 世代交代（-O stop →
-    // ssh -N -f。既存セッションは維持）まで自動で行う。世代ゲート + 再確立
-    // クールダウン付きなので、接続のたびに重い処理が連発することはない。
-    agent_socket::heal_agent_forward(host, false, true, &log);
+    // gpg relay の uplink が居ることを保証する（v0.14）。flock を試すだけなので
+    // 数 ms で、リモート実行は発生しない。切断からの復旧は uplink 自身が行う。
+    if let Ok(launcher) = std::env::current_exe() {
+        if let Err(e) = gpg_uplink::ensure_uplink(host, &launcher, &log) {
+            log(&format!("[uplink] {host}: 起動確認に失敗しました: {e}"));
+        }
+    }
     forwards::sync_ledger(host);
 }
 
@@ -197,18 +200,9 @@ fn preflight_master(host: &str, log: &dyn Fn(&str)) {
             ));
             pid
         }
-        MasterLiveness::Wedged => agent_socket::last_healthy_pid(host),
-        MasterLiveness::NoMaster => {
-            // 前世代の master が居た痕跡（last_healthy_pid）があるなら、次に走る
-            // 透過 ssh がユーザー config の ControlMaster=auto で新 master を立てる。
-            // その bind の前にリモート残骸 socket を ccc から明示的に unlink する
-            // （sshd の StreamLocalBindUnlink 頼みの沈黙失敗を回避）。
-            // last_healthy_pid が None（初回接続）は掃除不要なのでスキップ。
-            if agent_socket::last_healthy_pid(host).is_some() {
-                agent_socket::cleanup_stale_remote_sockets(host, log);
-            }
-            return;
-        }
+        MasterLiveness::Wedged => liveness::last_known_master_pid(host),
+        // master 不在は正常な不在。gpg socket は relay が持つので掃除も要らない
+        MasterLiveness::NoMaster => return,
         // Alive / SessionRefused は手を出さない
         _ => return,
     };
@@ -378,7 +372,7 @@ fn cmd_down(args: &[String]) -> i32 {
     // -O exit: master と全接続を畳んでポートも解放する。
     // -O stop はソケットだけ消して master とポートが残る（ゾンビ化）ので提供しない。
     // teardown_master は -O exit 無応答（wedged）時に kill フォールバックまで行う。
-    if liveness::teardown_master(host, agent_socket::last_healthy_pid(host), &stderr_log) {
+    if liveness::teardown_master(host, liveness::last_known_master_pid(host), &stderr_log) {
         println!("master を終了しました（次の接続で forward は自動再適用されます）");
         0
     } else {
@@ -392,40 +386,41 @@ fn cmd_heal(args: &[String]) -> i32 {
         eprintln!("使い方: ccc-ssh heal <host>");
         return 2;
     };
-    // heal はユーザーが明示的に「疑わしいから今すぐ張り直せ」と要求する経路。
-    //
-    // 1. preflight_master: half-open/wedged なら畳んで復旧。NoMaster+痕跡ありなら
-    //    後段の透過 ssh 用に残骸 socket を掃除
-    // 2. cleanup_stale_remote_sockets: **master が Alive でも**リモート socket を
-    //    明示的に unlink する。これにより、check が「Healthy」と誤判定するケース
-    //    （例: getinfo がローカル側パスを返し保守的に Healthy 扱いになる）でも、
-    //    直後の check が Broken を返し repair の -O cancel/-O forward -R が走って
-    //    forward が確実に張り直される。健全な forward も一瞬切断されるが、直後の
-    //    repair で数百 ms〜数秒で復元する（gpg 操作中は再試行を求む）
-    // 3. heal_agent_forward(force=true, cooldown 無視): check → mux repair →
-    //    それでも Broken なら master 世代交代（-O stop → ssh -N -f）→ 再 check。
-    //    mux repair は「master 起動時に bind 失敗した config RemoteForward」を
-    //    復旧できない（mux の重複検出で再要求が no-op になる）ため、世代交代が
-    //    唯一の修復手段になるケースがある
-    // 4. sync_ledger: 台帳の port forward をリプレイ
+    // v0.14 で gpg forward は relay 方式に移行し、「壊れたものを修復する」経路が
+    // 無くなった（uplink を作り直すだけ）。heal に残るのは master の死活復旧と
+    // port forward 台帳のリプレイで、gpg 側は uplink の張り直しに委ねる。
     preflight_master(host, &stderr_log);
-    agent_socket::cleanup_stale_remote_sockets(host, &stderr_log);
-    let outcome = agent_socket::heal_agent_forward(host, true, false, &stderr_log);
     forwards::sync_ledger(host);
-    match outcome {
-        agent_socket::HealOutcome::Healthy | agent_socket::HealOutcome::Indeterminate => {
-            println!("OK");
-            0
+
+    if gpg_uplink::is_running(host) {
+        match gpg_uplink::stop_uplink(host, &stderr_log) {
+            Ok(_) => {}
+            Err(e) => eprintln!("ccc-ssh: uplink の停止に失敗しました: {e}"),
         }
-        agent_socket::HealOutcome::NeedsMasterRebuild => {
-            eprintln!(
-                "ccc-ssh: mux では修復できず、ccc 専用 master のため世代交代は GUI が行います。\n\
-                 ccc GUI が起動中なら 60 秒以内の監視サイクルで自動復旧します。\n\
-                 今すぐ直したい場合は GUI でインスタンスを再接続してください。"
-            );
+    }
+    match std::env::current_exe() {
+        Ok(launcher) => match gpg_uplink::ensure_uplink(host, &launcher, &stderr_log) {
+            Ok(gpg_uplink::EnsureOutcome::Disabled) => {
+                println!("OK（このホストでは gpg relay は無効です）");
+                0
+            }
+            Ok(gpg_uplink::EnsureOutcome::StartFailed) => {
+                eprintln!("ccc-ssh: uplink を起動できませんでした（ccc-ssh gpg doctor {host}）");
+                1
+            }
+            Ok(_) => {
+                println!("OK");
+                0
+            }
+            Err(e) => {
+                eprintln!("ccc-ssh: {e}");
+                1
+            }
+        },
+        Err(e) => {
+            eprintln!("ccc-ssh: 自身の実行パスを取得できません: {e}");
             1
         }
-        agent_socket::HealOutcome::Failed => 1,
     }
 }
 

@@ -294,8 +294,9 @@ function SortableInstanceItem({
 }
 
 /**
- * gpg agent forward の疎通状態バッジ。healthy 時は非表示（クリーン UI）、
- * broken / unreachable / no_gpg のときだけ小さなドットで注意を引く。
+ * gpg relay の疎通状態バッジ（v0.14）。healthy 時は非表示（クリーン UI）、
+ * broken / unreachable のときだけ小さなドットで注意を引く。復旧は uplink
+ * デーモンが自動で行うため、バッジは「今どうなっているか」を伝えるだけ。
  */
 function GpgForwardBadge({ entry }: { entry: GpgForwardStatusEntry }) {
   if (entry.status === "healthy") {
@@ -329,20 +330,20 @@ function describeForwardStatus(entry: GpgForwardStatusEntry): {
         kind: "broken",
         label: "gpg⚠",
         title: entry.auto_heal_triggered
-          ? `gpg forward 断を検知 (${agoStr}) → 自動 heal 実行済み。改善しない場合は ccc-ssh heal <host> を試してください`
-          : `gpg forward 断を検知 (${agoStr})。ccc-ssh heal <host> で修復してください`,
+          ? `gpg relay 断を検知 (${agoStr})。自動で再接続を試みています`
+          : `gpg relay は繋がっていますが gpg を使えません (${agoStr})。ローカルの gpg-agent が停止している可能性があります（ccc-ssh gpg doctor <host>）`,
       };
     case "unreachable":
       return {
         kind: "warn",
         label: "gpg?",
-        title: `gpg forward 判定不能 (${agoStr}): master が半死に/未起動の可能性`,
+        title: `gpg relay に接続していません (${agoStr})。再接続待ちか、uplink が停止しています（ccc-ssh gpg status <host>）`,
       };
     case "no_gpg":
       return {
         kind: "warn",
         label: "gpg−",
-        title: `リモートに gpg-connect-agent が見当たらないため状態判定不能 (${agoStr})`,
+        title: `gpg relay の状態を判定できません (${agoStr})`,
       };
     // TypeScript の exhaustiveness には union で healthy が残るため fallback を返す
     default:

@@ -67,9 +67,9 @@ prepare-cli:
     cp -f "target/release/ccc-ssh" "binaries/ccc-ssh-${TRIPLE}"
     echo "cli: binaries/ccc-sessions-${TRIPLE}, binaries/ccc-ssh-${TRIPLE}"
 
-# ccc-claude-code-hook をホスト用にビルドし
-# src-tauri/binaries/ccc-claude-code-hook/<platform>/ccc-claude-code-hook へ配置。
-prepare-hook:
+# リモート配信バイナリ（hook / gpg relay）をホスト用にビルドし
+# src-tauri/binaries/<crate>/<platform>/<crate> へ配置。
+prepare-remote-bin CRATE:
     #!/usr/bin/env bash
     set -euo pipefail
     cd src-tauri
@@ -80,16 +80,15 @@ prepare-hook:
       "Linux arm64")   PLATFORM=linux-arm64 ;;
       *) echo "unsupported host: $(uname -sm)" >&2; exit 1 ;;
     esac
-    cargo build -p ccc-claude-code-hook --release
-    mkdir -p "binaries/ccc-claude-code-hook/${PLATFORM}"
-    cp -f "target/release/ccc-claude-code-hook" \
-       "binaries/ccc-claude-code-hook/${PLATFORM}/ccc-claude-code-hook"
-    echo "hook bin: binaries/ccc-claude-code-hook/${PLATFORM}/ccc-claude-code-hook"
+    cargo build -p {{CRATE}} --release
+    mkdir -p "binaries/{{CRATE}}/${PLATFORM}"
+    cp -f "target/release/{{CRATE}}" "binaries/{{CRATE}}/${PLATFORM}/{{CRATE}}"
+    echo "remote bin: binaries/{{CRATE}}/${PLATFORM}/{{CRATE}}"
 
-# 全プラットフォーム (darwin-arm64, linux-amd64, linux-arm64) 用 hook バイナリを配置。
+# 全プラットフォーム (darwin-arm64, linux-amd64, linux-arm64) 用に配置。
 # Linux 向けは musl による静的リンクで、リモート側の glibc バージョンに依存しない。
 # 事前に `just setup-cross` を一度実行してツールチェーンを揃えておくこと。
-prepare-hook-all: prepare-hook
+prepare-remote-bin-all CRATE: (prepare-remote-bin CRATE)
     #!/usr/bin/env bash
     set -euo pipefail
     cd src-tauri
@@ -98,12 +97,18 @@ prepare-hook-all: prepare-hook
         "x86_64-unknown-linux-musl:linux-amd64"; do
         triple="${entry%:*}"
         platform="${entry#*:}"
-        cargo zigbuild -p ccc-claude-code-hook --release --target "$triple"
-        mkdir -p "binaries/ccc-claude-code-hook/${platform}"
-        cp -f "target/${triple}/release/ccc-claude-code-hook" \
-              "binaries/ccc-claude-code-hook/${platform}/ccc-claude-code-hook"
-        echo "hook bin: binaries/ccc-claude-code-hook/${platform}/ccc-claude-code-hook"
+        cargo zigbuild -p {{CRATE}} --release --target "$triple"
+        mkdir -p "binaries/{{CRATE}}/${platform}"
+        cp -f "target/${triple}/release/{{CRATE}}" \
+              "binaries/{{CRATE}}/${platform}/{{CRATE}}"
+        echo "remote bin: binaries/{{CRATE}}/${platform}/{{CRATE}}"
     done
+
+# ホスト用の配信バイナリを揃える（dev 用）
+prepare-hook: (prepare-remote-bin "ccc-claude-code-hook") (prepare-remote-bin "ccc-gpg-relay")
+
+# 全プラットフォーム分の配信バイナリを揃える（配布用）
+prepare-hook-all: (prepare-remote-bin-all "ccc-claude-code-hook") (prepare-remote-bin-all "ccc-gpg-relay")
 
 # クロスコンパイル用ツールチェーンを揃える（ホスト = macOS arm64 想定、初回のみ実行）。
 # 必須: zig, cargo-zigbuild がローカルにインストール済みであること。

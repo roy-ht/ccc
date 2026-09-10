@@ -22,11 +22,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::agent_socket::Log;
 use crate::exec::run_with_timeout;
 use crate::forwards::{
     master_pid_detailed, mux_base_args, sanitize_alias, MasterCheck, MUX_OP_TIMEOUT,
 };
+use crate::log::Log;
 use crate::ssh_config;
 
 /// mux 経由 `true` 実行によるプローブの上限（GUI ループ用の既定値）。
@@ -79,10 +79,43 @@ pub fn probe_master(host_alias: &str, probe_timeout: Duration, log: Log) -> Mast
         probe_timeout,
     );
     match outcome {
-        Ok(o) => classify_probe(pid, o.timed_out, o.code),
+        Ok(o) => {
+            let liveness = classify_probe(pid, o.timed_out, o.code);
+            if let MasterLiveness::Alive { pid: Some(pid) } = liveness {
+                record_master_pid(host_alias, pid);
+            }
+            liveness
+        }
         // ssh バイナリ起動失敗等。判定不能は安全側（畳まない）
         Err(_) => MasterLiveness::SessionRefused { pid },
     }
+}
+
+/// 最後に疎通を確認した master の pid を記録する。
+///
+/// wedged（`-O check` が無応答）になると pid を取得できないため、kill
+/// フォールバックの対象を特定できない。v0.13 までは gpg の世代ゲートファイルを
+/// 流用していたが、v0.14 でそれが無くなったので liveness 自身が持つ。
+fn record_master_pid(host_alias: &str, pid: u32) {
+    let Some(path) = master_pid_path(host_alias) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, pid.to_string());
+}
+
+fn master_pid_path(host_alias: &str) -> Option<PathBuf> {
+    crate::paths::forwards_dir()
+        .ok()
+        .map(|d| d.join(format!("{}.master-pid", sanitize_alias(host_alias))))
+}
+
+/// 最後に疎通を確認した master の pid（wedged 時の kill 対象特定に使う）。
+pub fn last_known_master_pid(host_alias: &str) -> Option<u32> {
+    let path = master_pid_path(host_alias)?;
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 /// プローブ結果の分類（純粋関数）。畳むトリガーは「タイムアウトのみ」:
@@ -163,38 +196,6 @@ pub fn teardown_master(host_alias: &str, known_pid: Option<u32>, log: Log) -> bo
     wait_master_gone(host_alias, Duration::from_secs(2))
 }
 
-/// master を `-O stop` で**退役**させる。既存セッション（ターミナル・PTY）は
-/// 維持したまま control socket だけを外し、次の接続が新 master を立てられる
-/// 状態にする。戻り値は「socket が外れたことを確認できたか」。
-///
-/// `-O exit`（teardown_master）との使い分け:
-/// - exit: セッションごと全て畳む。half-open（どうせ死んでいる）向け
-/// - stop: セッションは生かしたまま世代交代だけ起こす。「master は生きているが
-///   forward が mux では修復不能」なケース（起動時 bind 失敗した config
-///   RemoteForward）向け。旧 master はゾンビとして残るが、保持している
-///   LocalForward ポートは引き続き旧 master が転送し続けるため実害は小さい
-pub fn stop_master(host_alias: &str, log: Log) -> bool {
-    let base = mux_base_args(host_alias).unwrap_or_default();
-    let result = run_with_timeout(
-        Command::new("ssh")
-            .args(&base)
-            .args(["-O", "stop", host_alias]),
-        MUX_OP_TIMEOUT,
-    );
-    match &result {
-        Ok(o) if o.success() => {
-            log(&format!(
-                "[liveness] {host_alias}: -O stop で master を退役させた（既存セッションは維持）"
-            ));
-        }
-        Ok(o) if o.timed_out => {
-            log(&format!("[liveness] {host_alias}: -O stop 無応答"));
-        }
-        _ => {}
-    }
-    wait_master_gone(host_alias, Duration::from_secs(2))
-}
-
 /// `-O check` が「master 不在」を返すまで待つ（250ms 間隔）。
 fn wait_master_gone(host_alias: &str, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
@@ -251,11 +252,6 @@ pub fn reestablish_user_cm_master(
     strict_forwards: bool,
     log: Log,
 ) -> Result<(), String> {
-    // 新 master が bind する前に、リモート側の残骸 socket を ccc 側から明示的に unlink する。
-    // 失敗しても続行（ログのみ）: 掃除に失敗した場合でも ssh -N -f が bind を試み、
-    // 沈黙故障は後段 `ensure_agent_forward` の check → repair が救う二段構え。
-    crate::agent_socket::cleanup_stale_remote_sockets(host_alias, log);
-
     let exit_on_forward_failure = if strict_forwards {
         "ExitOnForwardFailure=yes"
     } else {
@@ -434,7 +430,7 @@ pub fn recover_half_open(host_alias: &str, reestablish: bool, log: Log) -> bool 
             return false;
         }
         MasterLiveness::HalfOpen { pid } => *pid,
-        MasterLiveness::Wedged => crate::agent_socket::last_healthy_pid(host_alias),
+        MasterLiveness::Wedged => last_known_master_pid(host_alias),
     };
 
     if !matches!(liveness, MasterLiveness::NoMaster) && !teardown_master(host_alias, pid, log) {
@@ -463,58 +459,6 @@ pub fn recover_half_open(host_alias: &str, reestablish: bool, log: Log) -> bool 
             record_rebuild_attempt(host_alias, false);
             log(&format!("[liveness] {host_alias}: 再確立失敗: {e}"));
             false
-        }
-    }
-}
-
-/// **生きている** master を世代交代させる（ユーザー ControlMaster 尊重モード専用）。
-///
-/// 対象: 「master は Alive だが gpg forward が mux では修復不能」なケース。
-/// OpenSSH の mux master は、ssh config 由来の RemoteForward が
-/// `options.remote_forwards` に載っているため `-O forward -R` の再要求を
-/// 重複と判定して**サーバへ送らず OK を返す**（no-op）。さらに master 起動時に
-/// bind が失敗した forward は client 側の forward 記録が無効化済みのため
-/// `-O cancel` も失敗し options から消えない。つまりその master が生きている限り
-/// forward は復旧できず、世代交代が唯一の修復手段になる。
-///
-/// 手順: `-O stop`（既存セッション維持で socket だけ外す）→ 残骸 socket 掃除 +
-/// `ssh -N -f` 再確立（config の RemoteForward が新世代で張り直される）。
-///
-/// - GUI/CLI 横断のファイルロックで直列化
-/// - `respect_cooldown = true` なら直近の再確立試行から一定時間は実行しない
-///   （自動パス用。明示的な `ccc-ssh heal` は false でバイパス）
-/// - 結果は成功/失敗ともクールダウンに記録し、自動パスの連発を防ぐ
-pub fn replace_master_generation(
-    host_alias: &str,
-    respect_cooldown: bool,
-    log: Log,
-) -> Result<(), String> {
-    let Some(_lock) = acquire_rebuild_lock(host_alias) else {
-        return Err("別プロセスが復旧処理中（ロック取得失敗）".into());
-    };
-    if respect_cooldown {
-        if let Some(remaining) = cooldown_remaining(host_alias) {
-            return Err(format!("再確立クールダウン中（残り {remaining} 秒）"));
-        }
-    }
-
-    if !stop_master(host_alias, log) {
-        // stop が効かない（socket 残存）= master が固まっている可能性。exit/kill へ。
-        let pid = crate::agent_socket::last_healthy_pid(host_alias);
-        if !teardown_master(host_alias, pid, log) {
-            record_rebuild_attempt(host_alias, false);
-            return Err("master を退役させられませんでした".into());
-        }
-    }
-
-    match reestablish_user_cm_master(host_alias, false, log) {
-        Ok(()) => {
-            record_rebuild_attempt(host_alias, true);
-            Ok(())
-        }
-        Err(e) => {
-            record_rebuild_attempt(host_alias, false);
-            Err(format!("新 master の確立に失敗: {e}"))
         }
     }
 }

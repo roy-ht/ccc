@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "ccc",
-  "version": "0.12.1",
+  "version": "0.13.0",
   "identifier": "com.htanaka.ccc",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -29,7 +29,10 @@
     "resources": [
       "binaries/ccc-claude-code-hook/darwin-arm64/ccc-claude-code-hook",
       "binaries/ccc-claude-code-hook/linux-arm64/ccc-claude-code-hook",
-      "binaries/ccc-claude-code-hook/linux-amd64/ccc-claude-code-hook"
+      "binaries/ccc-claude-code-hook/linux-amd64/ccc-claude-code-hook",
+      "binaries/ccc-gpg-relay/darwin-arm64/ccc-gpg-relay",
+      "binaries/ccc-gpg-relay/linux-arm64/ccc-gpg-relay",
+      "binaries/ccc-gpg-relay/linux-amd64/ccc-gpg-relay"
     ],
     "icon": [
       "icons/32x32.png",

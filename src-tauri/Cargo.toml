@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/ccc-claude-auth", "crates/ccc-claude-code-hook", "crates/ccc-archive", "crates/ccc-sessions", "crates/ccc-sshkit", "crates/ccc-ssh"]
+members = [".", "crates/ccc-claude-auth", "crates/ccc-claude-code-hook", "crates/ccc-archive", "crates/ccc-sessions", "crates/ccc-sshkit", "crates/ccc-ssh", "crates/ccc-gpg-relay"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -10,7 +10,7 @@ sha2 = "0.10"
 
 [package]
 name = "ccc"
-version = "0.12.1"
+version = "0.13.0"
 description = "Claude Code Conductor"
 authors = ["Hiroyuki Tanaka"]
 edition = "2021"
@@ -39,5 +39,6 @@ axum = "0.7"
 rand = "0.8"
 ccc-archive = { path = "crates/ccc-archive" }
 ccc-sshkit = { path = "crates/ccc-sshkit" }
+ccc-gpg-relay = { path = "crates/ccc-gpg-relay" }
 vt100 = "0.16.2"
 libc = "0.2"
