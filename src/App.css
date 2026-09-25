@@ -3197,3 +3197,54 @@ html, body, #root {
   border-top: 1px solid var(--border);
   line-height: 1.6;
 }
+
+/* --- gpg agent forward（relay 方式, v0.14） --- */
+
+.gpg-row {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.gpg-row:last-child {
+  border-bottom: none;
+}
+
+/* 状態ドット。healthy は控えめに、異常時だけ色で引く（UI 演出の方針に合わせる） */
+.gpg-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.gpg-dot--ok {
+  background: var(--success);
+}
+
+.gpg-dot--warn {
+  background: var(--warn);
+}
+
+.gpg-dot--bad {
+  background: var(--danger);
+}
+
+.gpg-dot--off {
+  background: var(--text-muted);
+  opacity: 0.5;
+}
+
+/* 操作ボタン群は右端へ寄せる */
+.gpg-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.gpg-detail {
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.6;
+  font-family: var(--font-mono, monospace);
+}

@@ -6,6 +6,7 @@ mod commands;
 mod env_setup;
 mod explorer;
 mod forwards;
+mod gpg_forward;
 mod hook_receiver;
 mod hook_setup;
 mod instance;
@@ -255,6 +256,13 @@ pub fn run() {
             forwards::forwards_add,
             forwards::forwards_remove,
             agent_socket::get_gpg_forward_status,
+            gpg_forward::gpg_forward_list,
+            gpg_forward::gpg_forward_set_enabled,
+            gpg_forward::gpg_forward_remove,
+            gpg_forward::gpg_forward_up,
+            gpg_forward::gpg_forward_down,
+            gpg_forward::gpg_forward_restart,
+            gpg_forward::gpg_forward_stale_config,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

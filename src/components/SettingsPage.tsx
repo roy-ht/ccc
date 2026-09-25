@@ -5,8 +5,9 @@ import { useClaudeProfiles } from "../hooks/useClaudeProfiles";
 import { TERMINAL_THEMES, DEFAULT_TERMINAL_THEME_ID } from "../constants";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { ForwardsPanel } from "./ForwardsPanel";
+import { GpgForwardPanel } from "./GpgForwardPanel";
 
-type Category = "display" | "connections" | "forwards" | "tools";
+type Category = "display" | "connections" | "forwards" | "gpg" | "tools";
 
 interface Props {
   settings: AppSettings;
@@ -51,6 +52,12 @@ export function SettingsPage({ settings, onSave, onClose }: Props) {
             ポートフォワード
           </button>
           <button
+            className={`settings-nav-item${category === "gpg" ? " active" : ""}`}
+            onClick={() => setCategory("gpg")}
+          >
+            gpg forward
+          </button>
+          <button
             className={`settings-nav-item${category === "tools" ? " active" : ""}`}
             onClick={() => setCategory("tools")}
           >
@@ -65,6 +72,7 @@ export function SettingsPage({ settings, onSave, onClose }: Props) {
             <ConnectionSettingsPanel settings={settings} onSave={onSave} />
           )}
           {category === "forwards" && <ForwardsPanel />}
+          {category === "gpg" && <GpgForwardPanel />}
           {category === "tools" && <ToolsSettingsPanel />}
         </div>
       </div>

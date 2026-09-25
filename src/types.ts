@@ -300,3 +300,27 @@ export interface GlobalForwardRow {
   /** 同じ listen ポートを別のホストも登録している */
   conflict: boolean;
 }
+
+/**
+ * gpg agent forward（relay 方式, v0.14）の 1 ホット分。Rust `GpgForwardRow` と対応。
+ * 状態は uplink デーモンが書いた状態ファイルと flock から作られる（リモート実行なし）。
+ */
+export interface GpgForwardRow {
+  host_alias: string;
+  /** ~/.ccc/gpg.json で有効か */
+  enabled: boolean;
+  /** uplink デーモンが常駐しているか */
+  running: boolean;
+  health: "healthy" | "broken" | "unreachable" | "no_forward";
+  /** uplink が一度も動いていなければ null */
+  phase: "connecting" | "connected" | "retrying" | "auth_failed" | "stopped" | null;
+  generation: number;
+  reconnects: number;
+  /** 最終疎通の unix 秒（未疎通は null） */
+  last_ok_epoch: number | null;
+  remote_socket: string | null;
+  local_socket: string | null;
+  /** ローカル gpg-agent へ繋げるか */
+  local_agent: string | null;
+  last_error: string | null;
+}
