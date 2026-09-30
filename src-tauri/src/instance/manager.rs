@@ -84,7 +84,7 @@ pub struct InstanceManager {
     shell_pending_scrollback: Arc<DashMap<InstanceId, Vec<u8>>>,
     /// HookReceiver の接続情報。`CCC_HOOK_ENDPOINT` / `CCC_SESSION_TOKEN` 自体は
     /// tmux 焼き込みではなく `~/.ccc/bin/ccc-hook.sh` ラッパー経由で注入するが、
-    /// リモートに wrapper を scp で push する際にこの値を読み出す。
+    /// リモートに wrapper を rsync で push する際にこの値を読み出す。
     hook_endpoint: OnceLock<String>,
     hook_token: OnceLock<String>,
     /// `ssh -R <port>:127.0.0.1:<port>` の port 番号（リモート逆方向転送用）

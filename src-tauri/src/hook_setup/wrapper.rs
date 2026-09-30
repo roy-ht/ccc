@@ -73,7 +73,7 @@ pub fn write_local(creds: &HookCredentials<'_>) -> Result<PathBuf> {
     Ok(target)
 }
 
-/// リモートホストの `~/.ccc/bin/ccc-hook.sh` を scp で最新内容に上書きする。
+/// リモートホストの `~/.ccc/bin/ccc-hook.sh` を rsync で最新内容に上書きする。
 ///
 /// 呼び出し前提:
 /// - リモートに `~/.ccc/bin/` が既に存在する（`install_remote` で作成済み）
@@ -85,28 +85,35 @@ pub fn install_remote(host_alias: &str, creds: &HookCredentials<'_>) -> Result<(
     validate_endpoint(creds.endpoint)?;
     validate_token(creds.token)?;
 
-    // 同じ内容のテンプを scp で送る。`scp -p` でモードも持ち上がるが、リモート側で
+    // 同じ内容のテンプを rsync で送る。`-p` でモードも持ち上がるが、リモート側で
     // 後段の `chmod 755` を打って確実に実行可能にする。
     let content = render_script(creds);
     // セキュリティ: 同一プロセス内に他のユーザーがいないことを前提に temp_dir を使う。
-    // pid 込みで一意化、書き出し後すぐ scp して削除する。
+    // pid 込みで一意化、書き出し後すぐ送信して削除する。
     let tmp =
         std::env::temp_dir().join(format!("ccc-hook-{}-{}.sh", std::process::id(), host_alias));
     std::fs::write(&tmp, content.as_bytes())
         .with_context(|| format!("一時ファイル書き出し失敗: {}", tmp.display()))?;
 
-    let scp_target = format!("{host_alias}:.ccc/bin/{WRAPPER_SCRIPT_NAME}");
-    let scp_status = Command::new("scp")
-        .args(["-q", "-p"])
-        .arg(&tmp)
-        .arg(&scp_target)
-        .status();
+    let upload = ccc_sshkit::upload::upload_file(
+        host_alias,
+        &tmp,
+        &format!(".ccc/bin/{WRAPPER_SCRIPT_NAME}"),
+        std::time::Duration::from_secs(60),
+    );
     let _ = std::fs::remove_file(&tmp);
 
-    match scp_status {
-        Ok(s) if s.success() => {}
-        Ok(s) => return Err(anyhow!("scp が失敗: {s}")),
-        Err(e) => return Err(anyhow!("scp 起動失敗: {e}")),
+    match upload {
+        Ok(o) if o.success() => {}
+        Ok(o) => {
+            return Err(anyhow!(
+                "rsync が失敗 (code={:?}, timed_out={}): {}",
+                o.code,
+                o.timed_out,
+                o.stderr.trim()
+            ))
+        }
+        Err(e) => return Err(anyhow!("rsync 起動失敗: {e}")),
     }
 
     let chmod = Command::new("ssh")

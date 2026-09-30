@@ -21,3 +21,4 @@ pub mod liveness;
 pub mod log;
 pub mod paths;
 pub mod ssh_config;
+pub mod upload;

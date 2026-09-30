@@ -33,7 +33,7 @@ pub fn local_claude_config_dir(profile: &str) -> anyhow::Result<PathBuf> {
 
 /// ローカル `~/.ccc/agent_settings/` 全体を rsync でリモート
 /// `~/.ccc/agent_settings/` に同期し、Keychain の `.credentials.json` を
-/// 別途 scp で送信する。
+/// 別途 rsync で送信する。
 ///
 /// rsync を必須とする方針。ローカル単独 manifest 方式は不整合リスクが
 /// あるため採用しない。rsync が見つからない場合は明示的にインストール手順を
@@ -47,7 +47,7 @@ pub fn local_claude_config_dir(profile: &str) -> anyhow::Result<PathBuf> {
 /// 資格情報ファイル:
 /// - rsync では `--exclude=.credentials.json` で常に除外する
 /// - sidecar `ccc-claude-auth` 経由で macOS Keychain から取得し、
-///   リモートの値と比較した上で**必要なときだけ** scp で送信する
+///   リモートの値と比較した上で**必要なときだけ** rsync で送信する
 ///   (判定ロジックは [`super::auth_sync`]、転送は [`sync_remote_auth`])
 /// - Keychain にエントリがない場合は警告ログのみで起動を継続する
 ///   (リモート側で `claude /login` する想定)
@@ -144,7 +144,15 @@ pub fn prepare_remote_claude_config(
         ),
     );
     if !mkdir_out.status.success() {
-        anyhow::bail!("ssh mkdir failed for {host_alias}");
+        let stderr = String::from_utf8_lossy(&mkdir_out.stderr).trim().to_string();
+        debug_log::append(
+            log_path,
+            &format!("[prepare_config] ssh mkdir stderr: {stderr}"),
+        );
+        anyhow::bail!(
+            "ssh mkdir failed for {host_alias} ({}): {stderr}",
+            mkdir_out.status
+        );
     }
     let remote_home = String::from_utf8_lossy(&mkdir_out.stdout)
         .trim()
@@ -300,8 +308,8 @@ pub fn prepare_remote_claude_config(
 /// 上書きしない**ことを保証した上で、必要なときだけ転送する。判定は
 /// [`super::auth_sync::decide`] を参照。
 ///
-/// 転送は「一時ファイルへ scp → リモートで `chmod 600` → `mv -f`」の 3 段で行う。
-/// `.credentials.json` へ直接 scp すると、リモートで走行中の Claude が
+/// 転送は「一時ファイルへ rsync → リモートで `chmod 600` → `mv -f`」の 3 段で行う。
+/// `.credentials.json` へ直接送信すると、リモートで走行中の Claude が
 /// 切り詰められた JSON を読む窓が生まれるため。`mv` は同一ファイルシステム上の
 /// rename なので原子的。
 ///
@@ -630,27 +638,30 @@ fn push_remote_file_atomically(
             .map_err(|e| anyhow::anyhow!("一時ファイルの書き出しに失敗: {e}"))?;
     }
 
-    // scp のリモートパスは既存実装と同じくホーム相対で指定する。
-    // OpenSSH 9 以降は SFTP モードが既定でリモートシェル展開が効かないため、
-    // クォートを付けずホーム相対のまま渡すのが最も互換性が高い。
+    // リモートパスはホーム相対で指定する（rsync はホーム起点で解釈する）。
     let remote_tmp_rel = format!(".ccc/agent_settings/claude/{profile}/{file_name}.ccc-tmp");
-    let target = format!("{host_alias}:{remote_tmp_rel}");
     let t = std::time::Instant::now();
-    let scp_status = Command::new("scp")
-        .args(["-q", "-p"])
-        .arg(&local_tmp)
-        .arg(&target)
-        .status();
+    let upload = ccc_sshkit::upload::upload_file(
+        host_alias,
+        &local_tmp,
+        &remote_tmp_rel,
+        std::time::Duration::from_secs(60),
+    );
     let _ = std::fs::remove_file(&local_tmp);
     let elapsed = t.elapsed().as_millis();
 
-    match scp_status {
-        Ok(s) if s.success() => debug_log::append(
+    match upload {
+        Ok(o) if o.success() => debug_log::append(
             log_path,
-            &format!("[{tag}] scp 完了 (+{elapsed}ms) → {remote_tmp_rel}"),
+            &format!("[{tag}] rsync 完了 (+{elapsed}ms) → {remote_tmp_rel}"),
         ),
-        Ok(s) => anyhow::bail!("scp が失敗 (+{elapsed}ms, status={s})"),
-        Err(e) => anyhow::bail!("scp の起動に失敗 (+{elapsed}ms): {e}"),
+        Ok(o) => anyhow::bail!(
+            "rsync が失敗 (+{elapsed}ms, code={:?}, timed_out={}): {}",
+            o.code,
+            o.timed_out,
+            o.stderr.trim()
+        ),
+        Err(e) => anyhow::bail!("rsync の起動に失敗 (+{elapsed}ms): {e}"),
     }
 
     // chmod → mv を 1 回の ssh でまとめて実行する。

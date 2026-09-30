@@ -17,6 +17,7 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::exec::run_with_timeout;
 use crate::log::Log;
+use crate::upload::upload_file;
 
 /// 配信するバイナリ名。
 pub const BIN_NAME: &str = "ccc-gpg-relay";
@@ -25,7 +26,7 @@ pub const BIN_NAME: &str = "ccc-gpg-relay";
 pub const REMOTE_DIR: &str = ".ccc/bin";
 
 const SSH_TIMEOUT: Duration = Duration::from_secs(30);
-const SCP_TIMEOUT: Duration = Duration::from_secs(120);
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// 配信対象のプラットフォーム識別子（本体の `Platform::as_str` と揃える）。
 pub fn platform_from_uname(uname_sm: &str) -> Result<&'static str> {
@@ -182,18 +183,12 @@ pub fn deliver(host_alias: &str, log: Log) -> Result<()> {
     }
 
     let tmp = format!("{REMOTE_DIR}/{BIN_NAME}.new");
-    let outcome = run_with_timeout(
-        Command::new("scp")
-            .args(["-q", "-p", "-o", "BatchMode=yes"])
-            .arg(&src)
-            .arg(format!("{host_alias}:{tmp}")),
-        SCP_TIMEOUT,
-    )?;
+    let outcome = upload_file(host_alias, &src, &tmp, UPLOAD_TIMEOUT)?;
     if outcome.timed_out {
-        return Err(anyhow!("scp がタイムアウトしました"));
+        return Err(anyhow!("rsync がタイムアウトしました"));
     }
     if !outcome.success() {
-        return Err(anyhow!("scp が失敗しました: {}", outcome.stderr.trim()));
+        return Err(anyhow!("rsync が失敗しました: {}", outcome.stderr.trim()));
     }
 
     let (code, _, stderr) = ssh_plain(

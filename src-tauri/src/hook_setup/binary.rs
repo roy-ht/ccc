@@ -1,7 +1,7 @@
 //! `ccc-claude-code-hook` バイナリの配信。
 //!
 //! - ローカル: ホストアーキ用バイナリを `~/.ccc/bin/ccc-claude-code-hook` にコピー
-//! - リモート: `uname -sm` でアーキ判定 → 該当バイナリを scp で送信
+//! - リモート: `uname -sm` でアーキ判定 → 該当バイナリを rsync で送信
 //!
 //! バージョン管理は `--version` 出力を突き合わせて行う（不一致なら再配信）。
 
@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::hook_bin_dir;
+
+/// リモート配信（rsync）の上限時間。遅いトンネル越しでも 1〜2MB は収まる想定。
+const UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// 配信する 1 バイナリの仕様。
 ///
@@ -306,14 +309,15 @@ pub fn install_remote(spec: BinarySpec, host_alias: &str) -> Result<bool> {
     // 旧世代プロセスは自分の inode を持ったまま動き続け、次の起動から新版になる
     let src = bundled_binary(spec, platform)?;
     let tmp_remote = format!(".ccc/bin/{}.new", spec.name);
-    let scp_status = Command::new("scp")
-        .args(["-q", "-p"])
-        .arg(&src)
-        .arg(format!("{host_alias}:{tmp_remote}"))
-        .status()
-        .with_context(|| "scp 実行失敗".to_string())?;
-    if !scp_status.success() {
-        return Err(anyhow!("scp が失敗: {scp_status}"));
+    let upload = ccc_sshkit::upload::upload_file(host_alias, &src, &tmp_remote, UPLOAD_TIMEOUT)
+        .with_context(|| "rsync 実行失敗".to_string())?;
+    if !upload.success() {
+        return Err(anyhow!(
+            "rsync が失敗 (code={:?}, timed_out={}): {}",
+            upload.code,
+            upload.timed_out,
+            upload.stderr.trim()
+        ));
     }
 
     let finalize = Command::new("ssh")
